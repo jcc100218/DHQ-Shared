@@ -221,47 +221,70 @@ async function handleCallback() {
   } finally { _authPending = false; }
 }
 
+// One private-data journey keeps its app identity, provider session, and optional
+// caller selection throughout every request, cache lookup, and state publish.
+function _connectionContext(options = {}) {
+  const identity = _captureIdentity();
+  const sessionId = _getSessionId();
+  if (!identity || !sessionId) throw new Error('Sign in and reconnect Yahoo before continuing.');
+  const scope = { ...identity, sessionId,
+    assertCurrent() {
+      if (!_sameIdentity(scope) || _getSessionId() !== sessionId ||
+          (typeof options.isCurrent === 'function' && !options.isCurrent())) {
+        const error = new Error('Your account or Yahoo connection changed. Reload before continuing.');
+        error.code = 'YAHOO_CONTEXT_CHANGED';
+        throw error;
+      }
+    },
+  };
+  scope.assertCurrent();
+  return scope;
+}
+
 // ── API request ───────────────────────────────────────────────────
 
 /**
  * Makes an authenticated Yahoo Fantasy API request through the proxy.
  * Appends ?format=json so Yahoo returns JSON instead of XML.
  */
-async function apiRequest(endpoint) {
-  const sessionId = _getSessionId();
-  if (!sessionId) throw new Error('Not authenticated with Yahoo — please connect first.');
+async function apiRequest(endpoint, scope = _connectionContext()) {
+  scope.assertCurrent();
+  const sessionId = scope.sessionId;
   const sep = endpoint.includes('?') ? '&' : '?';
-  return _proxyPost({
+  const data = await _proxyPost({
     action:     'api',
     endpoint:   endpoint + sep + 'format=json',
     session_id: sessionId,
-  });
+  }, scope);
+  scope.assertCurrent();
+  return data;
 }
 
 // ── Fetch helpers ─────────────────────────────────────────────────
 
 /** All NFL leagues for the authenticated Yahoo user. */
-async function fetchUserLeagues() {
-  return apiRequest('/users;use_login=1/games;game_keys=nfl/leagues');
+async function fetchUserLeagues(scope = _connectionContext()) {
+  return apiRequest('/users;use_login=1/games;game_keys=nfl/leagues', scope);
 }
 
 /** League settings + all teams (parallel). */
-async function fetchLeague(leagueKey) {
+async function fetchLeague(leagueKey, scope = _connectionContext()) {
   const [leagueData, teamsData] = await Promise.all([
-    apiRequest(`/league/${leagueKey}/settings`),
-    apiRequest(`/league/${leagueKey}/teams`),
+    apiRequest(`/league/${leagueKey}/settings`, scope),
+    apiRequest(`/league/${leagueKey}/teams`, scope),
   ]);
+  scope.assertCurrent();
   return { leagueData, teamsData };
 }
 
 /** All team rosters in one batch request via ;out=roster sub-resource. */
-async function fetchRosters(leagueKey) {
-  return apiRequest(`/league/${leagueKey}/teams;out=roster`);
+async function fetchRosters(leagueKey, scope = _connectionContext()) {
+  return apiRequest(`/league/${leagueKey}/teams;out=roster`, scope);
 }
 
 /** Trade transactions for a league. */
-async function fetchTransactions(leagueKey) {
-  return apiRequest(`/league/${leagueKey}/transactions;type=trade`);
+async function fetchTransactions(leagueKey, scope = _connectionContext()) {
+  return apiRequest(`/league/${leagueKey}/transactions;type=trade`, scope);
 }
 
 // ── Yahoo JSON parsing helpers ────────────────────────────────────
@@ -675,15 +698,22 @@ function mapToSleeperState(leagueData, teamsData, rostersData, leagueKey, year, 
  * @param {string} leagueKey  Yahoo league key e.g. "423.l.12345"
  * @param {string} teamKey    Optional: Yahoo team key for current user
  */
-async function connectLeague(leagueKey, teamKey) {
+let _connectGeneration = 0;
+async function connectLeague(leagueKey, teamKey, options = {}) {
   const S = window.S || window.App?.S;
   if (!S) throw new Error('window.S not initialized');
+  const activeId = S.currentLeagueId, generation = ++_connectGeneration;
+  const scope = _connectionContext({ isCurrent: () => generation === _connectGeneration &&
+    (window.S || window.App?.S) === S && S.currentLeagueId === activeId &&
+    (typeof options.isCurrent !== 'function' || options.isCurrent()) });
 
   // ── 1. Fetch league settings + rosters in parallel ──
   const [{ leagueData, teamsData }, rostersData] = await Promise.all([
-    fetchLeague(leagueKey),
-    fetchRosters(leagueKey),
+    fetchLeague(leagueKey, scope),
+    fetchRosters(leagueKey, scope),
   ]);
+
+  scope.assertCurrent();
 
   // ── 2. Extract Yahoo players for crosswalk ──
   const rostersFC = rostersData?.fantasy_content || {};
@@ -713,6 +743,8 @@ async function connectLeague(leagueKey, teamKey) {
   const { players, rosters, league, leagueUsers } = mapToSleeperState(
     leagueData, teamsData, rostersData, leagueKey, year, crosswalk
   );
+
+  scope.assertCurrent();
 
   // ── 5. Populate window.S ──
   S.platform        = 'yahoo';
@@ -753,14 +785,23 @@ function _hasYahooSession() {
   return !!_getSessionId();
 }
 
-const _yahooRawStash = {};
-function _stashYahooRaw(leagueKey, raw) {
-  _yahooRawStash[leagueKey] = { raw, ts: Date.now() };
+let _yahooRawStash = new Map();
+let _yahooCacheBoundary = '';
+function _rawCache(scope) {
+  scope.assertCurrent();
+  const boundary = JSON.stringify([scope.ownerKey, scope.sessionVersion, scope.sessionId, scope.token, scope.epoch]);
+  if (boundary !== _yahooCacheBoundary) {
+    _yahooRawStash = new Map();
+    _yahooCacheBoundary = boundary;
+  }
+  return _yahooRawStash;
 }
-function _getYahooStashedRaw(leagueKey) {
-  const entry = _yahooRawStash[leagueKey];
-  if (!entry) return null;
-  if (Date.now() - entry.ts > 5 * 60 * 1000) return null;
+function _stashYahooRaw(leagueKey, raw, scope) {
+  _rawCache(scope).set(leagueKey, { raw, ts: Date.now() });
+}
+function _getYahooStashedRaw(leagueKey, scope) {
+  const entry = _rawCache(scope).get(leagueKey);
+  if (!entry || Date.now() - entry.ts > 5 * 60 * 1000) return null;
   return entry.raw;
 }
 
@@ -814,7 +855,9 @@ const YahooProvider = {
     }
 
     // Session exists — fetch the user's leagues
-    const rawList = await fetchUserLeagues();
+    const scope = _connectionContext();
+    const rawList = await fetchUserLeagues(scope);
+    scope.assertCurrent();
     const stubs = parseUserLeagues(rawList);
 
     return {
@@ -841,24 +884,27 @@ const YahooProvider = {
     if (!leagueKey) throw new Error('Yahoo league key missing');
 
     const context = ctx || {};
+    const scope = _connectionContext(context);
     const sleeperPlayers = context.sleeperPlayers || {};
     const currentWeek = context.currentWeek != null ? context.currentWeek : 0;
 
     // Reuse stashed raw if connect() was just called
     let leagueData, teamsData, rostersData;
-    const stashed = _getYahooStashedRaw(leagueKey);
+    const stashed = _getYahooStashedRaw(leagueKey, scope);
     if (stashed) {
       ({ leagueData, teamsData, rostersData } = stashed);
     } else {
       const [lgRes, rostersRes] = await Promise.all([
-        fetchLeague(leagueKey),
-        fetchRosters(leagueKey),
+        fetchLeague(leagueKey, scope),
+        fetchRosters(leagueKey, scope),
       ]);
       leagueData = lgRes.leagueData;
       teamsData = lgRes.teamsData;
       rostersData = rostersRes;
-      _stashYahooRaw(leagueKey, { leagueData, teamsData, rostersData });
+      _stashYahooRaw(leagueKey, { leagueData, teamsData, rostersData }, scope);
     }
+
+    scope.assertCurrent();
 
     // Extract year from league metadata
     const lgMeta = _yahooMeta(leagueData?.fantasy_content?.league || []);
@@ -891,7 +937,7 @@ const YahooProvider = {
     // Transactions — trade-only from Yahoo
     let txns = [];
     try {
-      const txRaw = await fetchTransactions(leagueKey);
+      const txRaw = await fetchTransactions(leagueKey, scope);
       const txFc  = txRaw?.fantasy_content || {};
       const txLg  = txFc.league || [];
       const txD   = _yahooData(Array.isArray(txLg) ? txLg : [txLg]);
@@ -906,9 +952,11 @@ const YahooProvider = {
         })
         .filter(Boolean);
     } catch (e) {
+      scope.assertCurrent(); // Optional provider outage cannot swallow account/selection changes.
       console.warn('[Yahoo] transactions fetch failed:', e?.message || e);
     }
 
+    scope.assertCurrent();
     const wkKey = 'w' + currentWeek;
     const transactionsByWeek = txns.length ? { [wkKey]: txns } : {};
 

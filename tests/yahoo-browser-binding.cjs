@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const path = require('node:path');
 const crypto = require('node:crypto').webcrypto;
-const source = fs.readFileSync(path.resolve(__dirname, '../yahoo-api.js'), 'utf8');
+const source = fs.readFileSync(process.env.YAHOO_MODULE_SOURCE || path.resolve(__dirname, '../yahoo-api.js'), 'utf8');
 const A='11111111-1111-4111-8111-111111111111',B='22222222-2222-4222-8222-222222222222';
 const token=(id=A,version=1)=>'fixture.'+Buffer.from(JSON.stringify({sub:id,app_metadata:{user_id:id,session_version:version}})).toString('base64url')+'.signature';
 const account=(id=A,version=1)=>JSON.stringify({token:token(id,version),user:{id}});
