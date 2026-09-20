@@ -1485,7 +1485,7 @@ async function mflLogin(opts) {
 
 // Submit a starting lineup to MFL.
 //   { leagueId, year, week, franchiseId, starterIds (Sleeper ids), mflByPid, apiKey }
-// FRANCHISE is sent explicitly (an MFL API key is account-scoped and may own more
+// FRANCHISE_ID is sent explicitly (an MFL API key is account-scoped and may own more
 // than one franchise, so we must name the target). mflByPid is the franchise's
 // own pid→MFL-id map (roster._mflPlayerIds) — preferred over the global crosswalk
 // reverse so we submit the exact id THIS franchise rosters.
@@ -1494,7 +1494,7 @@ async function submitLineup(opts) {
   const { leagueId, year, week, apiKey, franchiseId, mflByPid, cookie, host } = opts;
   const selected = _mflSelection(leagueId, year);
   const scope = _mflContext(selected.key, opts);
-  if (!/^\d{1,2}$/.test(String(week)) || Number(week) < 1 || Number(week) > 18) throw new Error('Select a valid MFL lineup week.');
+  if (!/^\d{1,2}$/.test(String(week)) || Number(week) < 1) throw new Error('Select a valid MFL lineup week.');
   if (!/^\d{1,4}$/.test(String(franchiseId || '')) || !Number(franchiseId)) throw new Error('Select your exact MFL franchise before submitting a lineup.');
   if (!cookie && !apiKey) throw new Error('Connect your MFL login to push lineups (MFL requires a login cookie for lineup changes).');
   if (cookie && !/^MFL_USER_ID=[^\s;]+$/.test(cookie)) throw new Error('Reconnect your MFL login before submitting a lineup.');
@@ -1510,7 +1510,7 @@ async function submitLineup(opts) {
   if (ids.some(id => !/^\d+$/.test(String(id || ''))) || new Set(ids.map(String)).size !== ids.length) throw new Error('Some starters could not be uniquely matched to MFL players. Check this franchise on MyFantasyLeague.');
   const base = cookie ? ('https://' + _mflLoginHost(host)) : MFL_BASE;
   let url = `${base}/${selected.year}/import?TYPE=lineup&L=${selected.id}&W=${encodeURIComponent(week)}`
-    + `&STARTERS=${ids.join(',')}&JSON=1&FRANCHISE=${String(franchiseId).padStart(4, '0')}`;
+    + `&STARTERS=${ids.join(',')}&JSON=1&FRANCHISE_ID=${String(franchiseId).padStart(4, '0')}`;
   if (apiKey && !cookie) url += `&APIKEY=${encodeURIComponent(apiKey)}`;
   const data = await _mflWriteTransport(url, { method: 'POST', ...(cookie ? { cookie } : {}) }, scope);
   scope.assertCurrent();
