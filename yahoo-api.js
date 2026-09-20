@@ -5,7 +5,7 @@
 //
 // window.Yahoo exposes:
 //   startAuth()                → redirects to Yahoo OAuth consent screen
-//   handleCallback(sessionId)  → stores OAuth session from Edge Function callback
+//   handleCallback()           → completes callback using same-tab browser proof
 //   apiRequest(endpoint)       → authenticated Yahoo API request via proxy
 //   fetchUserLeagues()         → all NFL leagues for the authenticated user
 //   fetchLeague(leagueKey)     → league settings + teams
@@ -100,48 +100,125 @@ function _setSessionId(id) {
 }
 
 // ── Proxy helper ──────────────────────────────────────────────────
-async function _proxyPost(body) {
-  const token = window.OD?.getSessionToken ? window.OD.getSessionToken() : null;
-  const res = await fetch(PROXY_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${token || SUPABASE_ANON}`,
-      'apikey': SUPABASE_ANON,
-    },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    if (err.auth_required) throw new Error('Yahoo auth expired — please reconnect.');
-    throw new Error(err.error || 'Yahoo proxy error ' + res.status);
-  }
-  return res.json();
+const FLOW_VERSION = 'browser-verifier-v2';
+const PENDING_KEY = 'dhq_yahoo_pending_v2';
+let _authPending = false;
+let _identityEpoch = 0;
+window.addEventListener('storage', event => {
+  if (!event.key || ['fw_session_v1', 'od_session_v1'].includes(event.key)) _identityEpoch++;
+});
+function _captureIdentity() {
+  try {
+    const token = window.OD?.getSessionToken?.();
+    if (!token) return null;
+    const claims = JSON.parse(window.atob(token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/')));
+    const meta = claims.app_metadata || {};
+    let ownerKey, sessionVersion = null;
+    if (meta.user_id || meta.session_version || /^[0-9a-f-]{36}$/i.test(claims.sub || '')) {
+      if (typeof meta.user_id !== 'string' || meta.user_id !== claims.sub || !Number.isInteger(meta.session_version) || meta.session_version < 1) return null;
+      const cached = JSON.parse(localStorage.getItem('fw_session_v1') || 'null');
+      if (cached?.user?.id !== meta.user_id || cached.token !== token) return null;
+      ownerKey = 'app:' + meta.user_id; sessionVersion = meta.session_version;
+    } else {
+      const name = meta.sleeper_username || claims.sleeper_username;
+      if (typeof name !== 'string' || !name.trim()) return null;
+      ownerKey = 'sleeper:' + name.toLowerCase();
+    }
+    return { token, ownerKey, sessionVersion, epoch: _identityEpoch };
+  } catch { return null; }
 }
+function _sameIdentity(context) {
+  const now = _captureIdentity();
+  return !!context && !!now && now.token === context.token && now.ownerKey === context.ownerKey && now.epoch === context.epoch;
+}
+async function _proxyPost(body, context) {
+  const token = context?.token || window.OD?.getSessionToken?.();
+  if (context && !_sameIdentity(context)) throw new Error('Your account changed. Start Yahoo connection again.');
+  const controller = new AbortController();
+  let timer;
+  try {
+    // Bound body parsing as well as fetch. Never replay consumed OAuth codes.
+    return await Promise.race([(async () => {
+      const res = await fetch(PROXY_URL, {
+        method: 'POST', signal: controller.signal,
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token || SUPABASE_ANON}`, apikey: SUPABASE_ANON },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (context && !_sameIdentity(context)) throw new Error('Your account changed. Start Yahoo connection again.');
+      if (!res.ok) throw new Error(data.auth_required ? 'Sign in again before connecting Yahoo.' : data.error || 'Yahoo proxy error ' + res.status);
+      return data;
+    })(), new Promise((_, reject) => { timer = setTimeout(() => { controller.abort(); reject(new Error('Yahoo connection was not confirmed. Start a new connection from this tab.')); }, 20000); })]);
+  } finally { clearTimeout(timer); }
+}
+function _randomProof() {
+  return Array.from(window.crypto.getRandomValues(new Uint8Array(32)), byte => byte.toString(16).padStart(2, '0')).join('');
+}
+async function _proofHash(value) {
+  return Array.from(new Uint8Array(await window.crypto.subtle.digest('SHA-256', new TextEncoder().encode(value))), byte => byte.toString(16).padStart(2, '0')).join('');
+}
+function _savePending(value) {
+  const raw = JSON.stringify(value);
+  try { sessionStorage.setItem(PENDING_KEY, raw); if (sessionStorage.getItem(PENDING_KEY) !== raw) throw new Error('not saved'); }
+  catch { throw new Error('This browser could not save connection recovery. Enable storage for this site, then try again.'); }
+}
+function _clearPending() { try { sessionStorage.removeItem(PENDING_KEY); } catch { /* A consumed server state cannot be replayed. */ } }
 
 // ── Auth ──────────────────────────────────────────────────────────
-
-/**
- * Initiates Yahoo OAuth flow. Gets the auth URL from the edge function
- * (keeps YAHOO_CLIENT_ID server-side), then redirects to Yahoo consent screen.
- */
 async function startAuth() {
-  const returnUrl = window.location.href.split('?')[0];
-  const data = await _proxyPost({ action: 'auth_url', return_url: returnUrl });
-  if (!data.auth_url) {
-    throw new Error('Failed to get Yahoo auth URL — check Supabase secrets (YAHOO_CLIENT_ID)');
-  }
-  window.location.href = data.auth_url;
+  if (_authPending) throw new Error('A Yahoo connection is already starting.');
+  const context = _captureIdentity();
+  if (!context) throw new Error('Sign in again before connecting Yahoo.');
+  _authPending = true;
+  try {
+    const returnUrl = new URL(window.location.href);
+    returnUrl.searchParams.delete('yahoo_session');
+    const verifier = _randomProof();
+    const pending = { ownerKey: context.ownerKey, sessionVersion: context.sessionVersion, returnUrl: returnUrl.href, verifier, createdAt: Date.now() };
+    _savePending(pending); // Prove storage works before any server or provider request.
+    const challenge = await _proofHash(verifier);
+    const data = await _proxyPost({ action: 'auth_url', flow_version: FLOW_VERSION, browser_challenge: challenge, return_url: pending.returnUrl }, context);
+    if (!_sameIdentity(context)) throw new Error('Your account changed. Start Yahoo connection again.');
+    const authUrl = new URL(data.auth_url);
+    if (data.flow_version !== FLOW_VERSION || !/^[a-f0-9]{64}$/.test(data.state || '') || authUrl.origin !== 'https://api.login.yahoo.com' || authUrl.pathname !== '/oauth2/request_auth' || authUrl.searchParams.get('state') !== data.state || authUrl.username || authUrl.password) {
+      throw new Error('Yahoo connection needs the updated app and service. Refresh and try again.');
+    }
+    _savePending({ ...pending, state: data.state });
+    window.location.href = authUrl.href;
+  } catch (error) { _clearPending(); throw error; }
+  finally { _authPending = false; }
 }
+function hasCallback() { return !!window.__DHQ_YAHOO_CALLBACK; }
 
-/**
- * Stores the session ID received from the OAuth callback redirect.
- * Called by app.js after detecting ?yahoo_session= in the URL.
- */
-function handleCallback(sessionId) {
-  if (!sessionId) throw new Error('No Yahoo session ID in callback');
-  _setSessionId(sessionId);
-  return sessionId;
+// The app's first inline head script captures the callback fragment and removes
+// it before any other script, image or stylesheet. It never persists the code.
+async function handleCallback() {
+  if (_authPending) throw new Error('Yahoo connection is already being checked.');
+  const callback = window.__DHQ_YAHOO_CALLBACK;
+  delete window.__DHQ_YAHOO_CALLBACK;
+  if (!callback || callback.error === 'legacy_restart') throw new Error('This Yahoo connection needs to be restarted from the updated app.');
+  const context = _captureIdentity();
+  let pending;
+  try { pending = JSON.parse(sessionStorage.getItem(PENDING_KEY) || 'null'); } catch { /* Visible retry below. */ }
+  if (!context || !pending || pending.state !== callback.state || pending.ownerKey !== context.ownerKey || pending.sessionVersion !== context.sessionVersion ||
+      !/^[a-f0-9]{64}$/.test(pending.verifier || '') || !Number.isFinite(pending.createdAt) || Date.now() - pending.createdAt > 600000 || pending.createdAt > Date.now()) {
+    throw new Error('Return to the tab and account that started Yahoo connection, or start a new connection here.');
+  }
+  const destination = new URL(pending.returnUrl), here = new URL(window.location.href);
+  if (destination.origin !== here.origin || destination.pathname !== here.pathname || destination.search !== here.search) throw new Error('Return to the app page that started Yahoo connection.');
+  window.history.replaceState(null, '', destination.href);
+  if (callback.error || typeof callback.code !== 'string' || !callback.code) { _clearPending(); throw new Error('Yahoo connection was not approved. You can start again.'); }
+  _authPending = true;
+  // Any uncertain acknowledgement needs a fresh flow; do not replay provider codes.
+  _clearPending();
+  try {
+    const data = await _proxyPost({ action: 'complete_auth', flow_version: FLOW_VERSION, state: pending.state, browser_verifier: pending.verifier, code: callback.code, return_url: pending.returnUrl }, context);
+    if (!_sameIdentity(context)) throw new Error('Your account changed. Start Yahoo connection again.');
+    if (data.flow_version !== FLOW_VERSION || typeof data.session_id !== 'string' || !/^[0-9a-f-]{36}$/i.test(data.session_id)) throw new Error('Yahoo connection was not confirmed. Start again.');
+    try { _setSessionId(data.session_id); if (_getSessionId() !== data.session_id) throw new Error('not saved'); }
+    catch { throw new Error('Yahoo connection could not be saved in this browser. Enable storage, then connect again.'); }
+    return data.session_id;
+  } finally { _authPending = false; }
 }
 
 // ── API request ───────────────────────────────────────────────────
@@ -866,6 +943,7 @@ window.Yahoo = {
   // Auth
   startAuth,
   handleCallback,
+  hasCallback,
   hasSession: _hasYahooSession,
 
   // Fetch
