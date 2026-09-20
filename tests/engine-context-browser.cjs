@@ -3,7 +3,7 @@
 // exercises the module contract; it is not a full public-product journey.
 // NODE_PATH=<public-consumer>/node_modules node tests/engine-context-browser.cjs [artifact-dir]
 const assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path'),http=require('node:http');
-const {chromium}=require('@playwright/test'),{fixture}=require('./helpers/engine-fixture.cjs');
+const {chromium}=require('@playwright/test'),{fixture,token}=require('./helpers/engine-fixture.cjs');
 const root=path.resolve(__dirname,'..'),out=path.resolve(process.argv[2]||'tmp/engine-context-browser'),data=fixture();
 const files=['storage.js','dhq-core.js','pick-value-model.js','dhq-providers.js','points-ledger.js','one-brain.js','dhq-engine.js'];
 const html=`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>body{font:16px system-ui;margin:20px;background:#17202b;color:white}button{min-height:44px;margin:5px;padding:10px;font:inherit}pre{white-space:pre-wrap;overflow-wrap:anywhere}</style></head><body>
@@ -11,7 +11,7 @@ const html=`<!doctype html><html><head><meta charset="utf-8"><meta name="viewpor
 <button id="active">Load active league 111</button><button id="background">Load background league 222</button><pre id="result">Ready</pre>
 <script>
 window.App={};window.events=[];window.cacheReads=[];window.cacheWrites=[];
-if(!localStorage.getItem('fw_session_v1'))localStorage.setItem('fw_session_v1',JSON.stringify({token:'fixture-token-A',user:{id:'fixture-A'}}));
+if(!localStorage.getItem('fw_session_v1'))localStorage.setItem('fw_session_v1',JSON.stringify({token:${JSON.stringify(token('fixture-A'))},user:{id:'fixture-A'}}));
 window.S=${JSON.stringify(data.state)};
 const ActualDate=Date;window.Date=class extends ActualDate{constructor(...args){super(...(args.length?args:['2026-09-20T00:00:00Z']));}static now(){return 1789862400000;}};
 window.Sleeper={fetchSeasonStats:year=>fetch('https://api.sleeper.app/v1/stats/nfl/regular/'+year).then(r=>{if(!r.ok)throw Error('HTTP '+r.status);return r.json();})};
@@ -55,7 +55,7 @@ function response(url){
   // New league forces cold work; a second real tab replaces account A while
   // the actual stats request is held. No artificial storage event is emitted.
   await page.evaluate(()=>{S.currentLeagueId='222';S.leagues[0].league_id='222';S.leagues[0].scoring_settings.pass_td=6;});hold=true;await page.getByRole('button',{name:'Load active league 111'}).click();await page.getByText('Loading',{exact:true}).waitFor();while(!held.length)await new Promise(r=>setTimeout(r,20));
-  const other=await context.newPage();await other.goto(origin);await other.evaluate(()=>localStorage.setItem('fw_session_v1',JSON.stringify({token:'fixture-token-B',user:{id:'fixture-B'}})));
+  const other=await context.newPage();await other.goto(origin);await other.evaluate(token=>localStorage.setItem('fw_session_v1',JSON.stringify({token,user:{id:'fixture-B'}})),token('fixture-B'));
   await page.waitForFunction(()=>!App.LI_LOADED);hold=false;held.splice(0).forEach(r=>r());await page.getByText(/Retry available:.*superseded/).waitFor();assert.equal(await page.evaluate(()=>window.DhqBrain),null);assert.equal(await page.evaluate(()=>lastResult),null);
   await page.screenshot({path:path.join(out,'account-switch-recovery.png')});
   await page.getByRole('button',{name:'Load active league 111'}).click();await page.getByText('Ready 222 · 8 values',{exact:true}).waitFor();assert.equal(await page.evaluate(()=>lastResult.leagueId),'222');assert.equal(await page.evaluate(()=>App.LI_LOADED),true);
