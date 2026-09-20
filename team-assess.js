@@ -278,7 +278,33 @@ window.App = window.App || {};
 
   function seasonDraftComplete(leagueInfo, curYear) {
     const seasonDrafts = leagueDrafts(leagueInfo).filter(d => pickInteger(d.season) === curYear);
-    return seasonDrafts.length > 0 && seasonDrafts.every(d => pickStatus(d.status) === 'complete');
+    return seasonDrafts.length > 0 && seasonDrafts.every(d => pickStatus(d.status) === 'complete'
+      && (d._source !== 'mfl' || (mflBoardComplete(d, leagueInfo) && d._slots.every(p => String(p.player_id || '').trim()))));
+  }
+
+  function currentDraftRounds(draft, league) {
+    // The MFL adapter derives dimensions from the returned rows. A truncated
+    // response cannot certify its own length; require separate configuration.
+    return pickInteger(draft?._dimensionsInferred ? league?.settings?.draft_rounds
+      : draft?.settings?.rounds) ?? (draft?._dimensionsInferred ? null : pickInteger(league?.settings?.draft_rounds));
+  }
+
+  function mflBoardComplete(draft, league) {
+    const rounds = currentDraftRounds(draft, league);
+    const teams = pickInteger(draft?._dimensionsInferred ? league?.total_rosters : draft?.settings?.teams)
+      ?? pickInteger(league?.total_rosters);
+    if (!rounds || rounds > 100 || !teams || teams < 1 || !Array.isArray(draft?._slots)
+      || draft._slots.length !== rounds * teams) return false;
+    const seen = new Set();
+    return draft._slots.every(p => {
+      const round = pickInteger(p?.round), slot = pickInteger(p?.draft_slot);
+      const key = round + '|' + slot;
+      if (!p || !round || round < 1 || round > rounds || !slot || slot < 1 || slot > teams || seen.has(key)
+        || !String(p.roster_id ?? '').trim() || typeof p.player_id !== 'string'
+        || (p.draft_id && String(p.draft_id) !== String(draft.draft_id))
+        || (p.league_id && String(p.league_id) !== pickLeagueId(league))) return false;
+      seen.add(key); return true;
+    });
   }
 
   /**
@@ -299,7 +325,7 @@ window.App = window.App || {};
     const rounds = pickInteger(league?.settings?.draft_rounds);
     const years = season ? tradeablePickYears(league, season) : [];
     const drafts = leagueDrafts(league).filter(d => pickInteger(d.season) === season);
-    const currentRounds = drafts.length === 1 ? pickInteger(drafts[0].settings?.rounds) ?? rounds : rounds;
+    const currentRounds = drafts.length === 1 ? currentDraftRounds(drafts[0], league) : rounds;
     const roundsByYear = Object.fromEntries(years.map(year => [year, year === season ? currentRounds : rounds]));
     return { season, rounds, roundsByYear, years, drafts, format: pickFormat(league) };
   }
@@ -309,12 +335,12 @@ window.App = window.App || {};
     // Same-length ownership transfers, consumed slots, loading/error recovery,
     // and format overrides all change capital without changing any roster.
     const canonicalRows = rows => rows.map(row => JSON.stringify(row)).sort();
-    const slots = rows => Array.isArray(rows) ? canonicalRows(rows.map(p => [String(p?.draft_id || ''),
-      pickInteger(p?.round), pickInteger(p?.draft_slot), String(p?.roster_id ?? ''), String(p?.player_id || '')])) : null;
+    const slots = rows => Array.isArray(rows) ? canonicalRows(rows.map(p => [String(p?.draft_id || ''), String(p?.league_id || ''),
+      pickInteger(p?.round), pickInteger(p?.draft_slot), String(p?.roster_id ?? ''), typeof p?.player_id, String(p?.player_id || '')])) : null;
     const lid = pickLeagueId(league);
-    return JSON.stringify([lid, c.format, c.season, c.rounds, pickStatus(league?.status),
+    return JSON.stringify([lid, c.format, c.season, c.rounds, pickInteger(league?.total_rosters), pickStatus(league?.status),
       canonicalRows(c.drafts.map(d => [String(d.draft_id || ''), String(d.league_id || ''), d.season, pickStatus(d.status),
-        pickInteger(d.settings?.rounds), d._source,
+        pickInteger(d.settings?.rounds), pickInteger(d.settings?.teams), d._source, !!d._dimensionsInferred,
         canonicalRows(Object.entries(d.slot_to_roster_id || {}).map(([slot, rid]) => [pickInteger(slot), String(rid)])), slots(d.picks), slots(d._slots)])),
       Array.isArray(tradedPicks) ? canonicalRows(tradedPicks.filter(p => !p?.league_id || String(p.league_id) === lid)
         .map(p => [pickInteger(p?.season), pickInteger(p?.round), String(p?.roster_id ?? ''), String(p?.owner_id ?? '')])) : null]);
@@ -339,6 +365,8 @@ window.App = window.App || {};
     if (!curYear || Object.values(roundsByYear).some(rounds => !Number.isInteger(rounds) || rounds < 0 || rounds > 100)) unknown('Draft season or rounds are unavailable.');
     if (!['dynasty', 'redraft', 'keeper', 'best_ball', 'dfs'].includes(context.format)) unknown('League format is unavailable.');
     if (!Array.isArray(tradedPicks)) unknown('Pick ownership has not loaded.');
+    if (drafts.some(d => d._source === 'mfl' && (!mflBoardComplete(d, leagueInfo)
+      || d._slots.some(p => !rosterIds.has(String(p.roster_id)))))) unknown('The complete MFL draft board has not been established.');
     const result = {};
     rows.forEach(r => { result[r.roster_id] = []; });
     // Preserve the public roster→array shape. Non-enumerable coverage is also
@@ -378,19 +406,26 @@ window.App = window.App || {};
           // MFL slots already name their current owner; its first-round order
           // cannot establish original ownership after intra-round trades.
           currentSlots = draft._slots;
-          const slotIds = new Set(currentSlots.map(p => p?.round + '|' + p?.draft_slot));
-          currentKnown = currentSlots.length > 0 && slotIds.size === currentSlots.length
-            && currentSlots.every(p => p && rosterIds.has(String(p.roster_id)) && pickInteger(p.round) > 0
-              && pickInteger(p.round) <= roundsByYear[curYear] && pickInteger(p.draft_slot) > 0);
+          const made = currentSlots.filter(p => String(p.player_id || '').trim()).length;
+          currentKnown = mflBoardComplete(draft, leagueInfo)
+            && ((status === 'pre_draft' && made === 0) || (status === 'drafting' && made > 0 && made < currentSlots.length));
         } else if (status === 'drafting') {
-          currentKnown = Array.isArray(draft.picks);
+          const slotMap = Object.entries(draft.slot_to_roster_id || {});
+          const mappedOwners = new Set(slotMap.map(([, rid]) => String(rid)));
+          const mappedSlots = new Set(slotMap.map(([slot]) => pickInteger(slot)));
+          currentKnown = Array.isArray(draft.picks) && slotMap.length === rosterIds.size && mappedOwners.size === rosterIds.size
+            && mappedSlots.size === rosterIds.size
+            && slotMap.every(([slot, rid]) => pickInteger(slot) > 0 && pickInteger(slot) <= rosterIds.size && rosterIds.has(String(rid)));
           for (const pick of draft.picks || []) {
             if (!pick) { currentKnown = false; continue; }
-            if (pick.draft_id && String(pick.draft_id) !== String(draft.draft_id)) { currentKnown = false; continue; }
+            if ((pick.draft_id && String(pick.draft_id) !== String(draft.draft_id))
+              || (pick.league_id && String(pick.league_id) !== lid)) { currentKnown = false; continue; }
             const original = draft.slot_to_roster_id?.[pick.draft_slot];
             const round = pickInteger(pick.round);
-            if (!rosterIds.has(String(original)) || !round || round > roundsByYear[curYear] || !pick.player_id) { currentKnown = false; continue; }
-            consumed.add(curYear + '|' + round + '|' + String(original));
+            const key = curYear + '|' + round + '|' + String(original);
+            if (!rosterIds.has(String(original)) || !round || round < 1 || round > roundsByYear[curYear] || !pick.player_id
+              || (pick.roster_id != null && !rosterIds.has(String(pick.roster_id))) || consumed.has(key)) { currentKnown = false; continue; }
+            consumed.add(key);
           }
         } else currentKnown = status === 'pre_draft';
       } else {

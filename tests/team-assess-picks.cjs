@@ -5,7 +5,7 @@ const path = require('node:path');
 const vm = require('node:vm');
 const source = fs.readFileSync(process.env.ASSESS_SOURCE || path.join(__dirname, '..', 'team-assess.js'), 'utf8');
 const plain = value => JSON.parse(JSON.stringify(value));
-const league = (extra = {}) => ({ league_id: 'league-a', season: '2026', status: 'pre_draft', settings: { type: 2, draft_rounds: 4 }, roster_positions: ['QB', 'WR', 'BN'], ...extra });
+const league = (extra = {}) => ({ league_id: 'league-a', season: '2026', status: 'pre_draft', total_rosters: 2, settings: { type: 2, draft_rounds: 4 }, roster_positions: ['QB', 'WR', 'BN'], ...extra });
 const draft = (extra = {}) => ({ draft_id: 'draft-a', league_id: 'league-a', season: '2026', status: 'pre_draft', slot_to_roster_id: { 1: 1, 2: 2 }, ...extra });
 function fixture({ ready = false, storage = new Map(), moduleSource = source } = {}) {
   const rosters = [
@@ -134,12 +134,88 @@ const tests = {
     assert.equal(x.assess({ ...league(), season: undefined }, [])[0].picksAssessment, null);
   },
   mflPartialBoardUsesCurrentSlotOwner() {
-    const x = fixture(), l = league({ drafts: [draft({ _source: 'mfl', status: 'drafting', _slots: [
+    const x = fixture(), l = league({ drafts: [draft({ _source: 'mfl', settings: { rounds: 1, teams: 2 }, status: 'drafting', _slots: [
       { round: 1, draft_slot: 1, roster_id: 2, player_id: 'rookie' },
       { round: 1, draft_slot: 2, roster_id: 2, player_id: '' },
     ] })] });
     const p = x.holdings(l); assert.equal(p[1].length, 8); assert.equal(p[2].length, 9);
+    assert.equal(p.coverage.complete, true, 'explicit one-round board is complete');
     assert.equal(p[2].filter(p => p.year === 2026)[0].originalOwnerRid, null);
+  },
+  mflTruncatedGappedAndForeignBoardsStayUnavailable() {
+    const x = fixture();
+    const slots = Array.from({ length: 8 }, (_, i) => ({ round: Math.floor(i / 2) + 1, draft_slot: i % 2 + 1, roster_id: i % 2 + 1, player_id: i === 0 ? 'rookie' : '' }));
+    for (const bad of [slots.slice(0, 2), slots.slice(0, 7), slots.filter((_, i) => i !== 3),
+      slots.map((p, i) => i === 3 ? { ...p, draft_slot: 3 } : p),
+      slots.map((p, i) => i === 3 ? { ...slots[2] } : p),
+      slots.map((p, i) => i === 3 ? { ...p, draft_id: 'foreign-draft' } : p),
+      slots.map((p, i) => i === 3 ? { ...p, league_id: 'foreign-league' } : p),
+      slots.map((p, i) => i === 3 ? { ...p, roster_id: 'foreign-roster' } : p)]) {
+      const l = league({ drafts: [draft({ _source: 'mfl', status: 'drafting', _slots: bad })] });
+      assert.equal(x.holdings(l).coverage.complete, false, JSON.stringify(bad));
+      assert.equal(x.assess(l, [])[0].picksAssessment, null);
+    }
+    const l = league({ drafts: [draft({ _source: 'mfl', status: 'drafting', _slots: slots })] });
+    assert.equal(x.holdings(l).coverage.complete, true); assert.equal(x.holdings(l)[1].length, 11);
+    l.drafts[0].status = 'complete';
+    assert.equal(x.holdings(l).coverage.complete, false, 'complete status cannot consume an unfinished inferred MFL board');
+    l.drafts[0]._slots = slots.map(p => ({ ...p, player_id: 'made-' + p.round + '-' + p.draft_slot }));
+    const complete = x.holdings(l); assert.equal(complete.coverage.complete, true);
+    assert.deepEqual([...new Set(complete[1].map(p => p.year))], [2027, 2028, 2029]); assert.equal(complete[1].length, 12);
+    l.drafts[0]._slots = l.drafts[0]._slots.slice(0, 2);
+    assert.equal(x.holdings(l).coverage.complete, false, 'truncated all-made board cannot trigger dynasty rollover');
+  },
+  mflAdapterInferredDimensionsCannotCertifyTheirOwnPayload() {
+    const x = fixture();
+    const mapper = fs.readFileSync(path.join(__dirname, '..', 'mfl-api.js'), 'utf8');
+    const start = mapper.indexOf('function mapDraftStatus(');
+    const run = vm.runInNewContext('(' + mapper.slice(start, mapper.indexOf('\n/**', start)).trim() + ')');
+    const payload = { draftResults: { draftUnit: { draftPick: [
+      { round: '1', pick: '1', franchise: '1', player: '100' },
+      { round: '1', pick: '2', franchise: '2', player: '' },
+    ] } } };
+    const mapped = run(payload, '123', '2026', {}, {}); assert.equal(mapped[0]._dimensionsInferred, true);
+    const l = league({ league_id: 'mfl_123_2026', drafts: mapped });
+    assert.equal(mapped[0].settings.rounds, 1, 'adapter sees only the truncated first round');
+    assert.equal(x.holdings(l).coverage.complete, false, 'four configured rounds cannot be certified by inferred one-round payload');
+    l.settings.draft_rounds = 1;
+    assert.equal(x.holdings(l).coverage.complete, true, 'independent one-round configuration resolves the same payload');
+    delete l.settings.draft_rounds;
+    assert.equal(x.holdings(l).coverage.complete, false, 'missing configured dimensions remain unknown');
+  },
+  sleeperMissingSlotMapDuplicateAndForeignProgressStayUnavailable() {
+    const x = fixture(), made = { draft_id: 'draft-a', round: 1, draft_slot: 1, roster_id: 2, player_id: 'rookie' };
+    for (const extra of [
+      { slot_to_roster_id: { 1: 1 }, picks: [made] },
+      { slot_to_roster_id: { 1: 1, 2: 1 }, picks: [made] },
+      { slot_to_roster_id: { 1: 1, 3: 2 }, picks: [made] },
+      { slot_to_roster_id: { 1: 1, '01': 2 }, picks: [made] },
+      { picks: [made, { ...made }] },
+      { picks: [made, { ...made, player_id: 'different-player' }] },
+      { picks: [{ ...made, league_id: 'foreign-league' }] },
+      { picks: [{ ...made, roster_id: 'foreign-roster' }] },
+    ]) {
+      const l = league({ drafts: [draft({ status: 'drafting', ...extra })] });
+      assert.equal(x.holdings(l).coverage.complete, false, JSON.stringify(extra));
+      assert.equal(x.assess(l, [])[0].picksAssessment, null);
+    }
+    assert.equal(x.holdings(league({ drafts: [draft({ status: 'drafting', picks: [made] })] })).coverage.complete, true);
+  },
+  mflBoardEvidenceRecoveryInvalidatesSavedAssessment() {
+    for (const ready of [false, true]) {
+      const x = fixture({ ready }), d = draft({ _source: 'mfl', settings: { rounds: 1, teams: 3 }, status: 'pre_draft', _slots: [
+        { round: 1, draft_slot: 1, roster_id: 1, player_id: '' },
+        { round: 1, draft_slot: 2, roster_id: 2, player_id: '' },
+      ] });
+      x.ctx.S.leagues[0].drafts = [d];
+      assert.equal(x.global()[0].picksAssessment, null);
+      d.settings.teams = 2; assert.equal(x.global()[0].picksAssessment.totalPicks, 9);
+      delete d._slots[1].player_id; assert.equal(x.global()[0].picksAssessment, null);
+      d._slots[1].player_id = ''; assert.equal(x.global()[0].picksAssessment.totalPicks, 9);
+      d._dimensionsInferred = true; assert.equal(x.global()[0].picksAssessment, null);
+      x.ctx.S.leagues[0].settings.draft_rounds = 1; assert.equal(x.global()[0].picksAssessment.totalPicks, 3);
+      x.reload(); assert.equal(x.global()[0].picksAssessment.totalPicks, 3);
+    }
   },
   nonPickHealthRankAndInjuryContractsAreStable() {
     const x = fixture(), before = plain(x.assess(league(), []));
