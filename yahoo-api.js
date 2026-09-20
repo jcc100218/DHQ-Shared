@@ -648,6 +648,7 @@ function _transactionRows(raw, leagueKey, season, crosswalk, rosters) {
       Object.keys(collection).filter(key => /^\d+$/.test(key)).length !== count) throw incomplete('transaction collection is incomplete.');
   const owners = new Set(rosters.map(roster => String(roster.roster_id))), keys = new Set(), rows = [];
   let excludedTradeCount = 0;
+  const tradePlayers = {};
   for (let i = 0; i < count; i++) {
     const resource = collection[i]?.transaction;
     const tx = { ..._resourceMetadata(_yahooMeta(resource)), ..._yahooData(resource) };
@@ -677,11 +678,16 @@ function _transactionRows(raw, leagueKey, season, crosswalk, rosters) {
       }
       if (from === to) throw incomplete('trade source and destination are identical.');
       seen.add(id);
+      const mappedPlayer = mapYahooPlayer({ player });
+      if (mappedPlayer) {
+        const mappedId = crosswalk[id] || 'yahoo_' + id;
+        tradePlayers[mappedId] = { ...mappedPlayer, player_id: mappedId };
+      }
     }
     if (teams.size < 2) throw incomplete('trade sides are incomplete.');
     rows.push(mapYahooTrade(tx, crosswalk));
   }
-  return { rows, excludedTradeCount };
+  return { rows, excludedTradeCount, players: tradePlayers };
 }
 
 // ── Player crosswalk ──────────────────────────────────────────────
@@ -865,6 +871,17 @@ function mapToSleeperState(leagueData, teamsData, rostersData, leagueKey, year, 
  * @param {string} teamKey    Optional: Yahoo team key for current user
  */
 let _connectGeneration = 0;
+const _legacyYahooContexts = new WeakMap();
+function captureStateContext(state) {
+  const scope = state && _legacyYahooContexts.get(state);
+  let retired = !scope;
+  return { isCurrent() {
+    if (retired || _legacyYahooContexts.get(state) !== scope) return false;
+    try { scope.assertCurrent(); return true; }
+    catch { retired = true; if (_legacyYahooContexts.get(state) === scope) _legacyYahooContexts.delete(state); return false; }
+  } };
+}
+function isStateCurrent(state) { return captureStateContext(state).isCurrent(); }
 async function connectLeague(leagueKey, teamKey, options = {}) {
   const S = window.S || window.App?.S;
   if (!S) throw new Error('window.S not initialized');
@@ -875,44 +892,16 @@ async function connectLeague(leagueKey, teamKey, options = {}) {
 
   leagueKey = await _resolvedLeagueKey(leagueKey, scope, options.season || options.currentSeason);
 
-  // ── 1. Fetch league settings + rosters in parallel ──
-  const [{ leagueData, teamsData }, rostersData] = await Promise.all([
-    fetchLeague(leagueKey, scope),
-    fetchRosters(leagueKey, scope),
-  ]);
-
-  scope.assertCurrent();
-
-  const year = _validatedBundle(leagueData, teamsData, rostersData, leagueKey, options.season || options.currentSeason);
-
-  // ── 2. Extract Yahoo players for crosswalk ──
-  const rostersFC = rostersData?.fantasy_content || {};
-  const rostersLg = rostersFC.league || [];
-  const rostersD  = _yahooData(Array.isArray(rostersLg) ? rostersLg : [rostersLg]);
-  const rTeamsArr = _yahooArr(rostersD?.teams || {});
-
-  const yahooPlayersForCW = [];
-  rTeamsArr.forEach(tEntry => {
-    if (!tEntry?.team) return;
-    const tData     = _yahooData(tEntry.team);
-    const rosterObj = tData?.roster || {};
-    const rPart     = rosterObj['0'] || rosterObj;
-    _yahooArr(rPart?.players || {}).forEach(pEntry => {
-      const mapped = mapYahooPlayer({ player: pEntry?.player });
-      if (mapped && mapped._yahoo_id) yahooPlayersForCW.push(mapped);
-    });
+  // Legacy Scout uses the same validated hydration/feed path as the newer
+  // provider consumer. No second transaction implementation or empty success.
+  const hydrated = await YahooProvider.hydrate({ id: 'yahoo_' + leagueKey, _yahoo: true,
+    _yahooLeagueKey: leagueKey, ...(options.season || options.currentSeason ? { season: String(options.season || options.currentSeason) } : {}) }, {
+    sleeperPlayers: S.players || {}, currentWeek: S.currentWeek,
+    isCurrent: () => { scope.assertCurrent(); return true; },
   });
-
-
-  // ── 3. Build crosswalk against Sleeper player DB ──
-  const crosswalk = buildCrosswalk(S.players || {}, yahooPlayersForCW, year);
-
-  // ── 4. Map Yahoo data → Sleeper-equivalent format ──
-  const { players, rosters, league, leagueUsers } = mapToSleeperState(
-    leagueData, teamsData, rostersData, leagueKey, year, crosswalk
-  );
-
   scope.assertCurrent();
+  const { players, rosters, league, leagueUsers } = hydrated;
+  const year = Number(league.season);
 
   // ── 5. Populate window.S ──
   S.platform        = 'yahoo';
@@ -926,7 +915,8 @@ async function connectLeague(leagueKey, teamKey, options = {}) {
   S.drafts          = [];
   S.bracket         = { w: [], l: [] };
   S.matchups        = {};
-  S.transactions    = {};
+  S.transactions    = hydrated.transactions;
+  S.transactionStatus = hydrated.transactionStatus;
   S.season          = String(year);
   S.leagues         = [league];
   S.currentLeagueId = league.league_id;
@@ -938,7 +928,10 @@ async function connectLeague(leagueKey, teamKey, options = {}) {
     S.myRosterId = myRoster?.roster_id || null;
   }
 
-  return { players, rosters, league, leagueUsers };
+  _legacyYahooContexts.set(S, _connectionContext({ isCurrent: () => generation === _connectGeneration &&
+    (window.S || window.App?.S) === S && S.currentLeagueId === league.league_id &&
+    S.yahooLeagueKey === leagueKey && String(S.yahooYear) === String(year) }));
+  return { ...hydrated };
 }
 
 // ── PlatformProvider adapter ──────────────────────────────────────
@@ -1118,23 +1111,24 @@ const YahooProvider = {
     const mapped = mapToSleeperState(leagueData, teamsData, rostersData, leagueKey, year, crosswalk);
 
     // This endpoint is a completed trade feed, not add/drop/waiver history.
-    let txns = [], transactionStatus;
+    let txns = [], tradePlayers = {}, transactionStatus;
     const transactionKey = leagueKey + ':' + year, checkedAt = Date.now();
     try {
       const txRaw = await fetchTransactions(leagueKey, scope, year);
       scope.assertCurrent();
       const feed = _transactionRows(txRaw, leagueKey, year, crosswalk, mapped.rosters);
       txns = feed.rows;
+      tradePlayers = feed.players;
       const lastSuccessAt = Date.now();
       _rawCache(scope); // Revalidate the account/session boundary before caching.
-      _yahooTransactionStash.set(transactionKey, { rows: JSON.stringify(txns), lastSuccessAt, excludedTradeCount: feed.excludedTradeCount });
+      _yahooTransactionStash.set(transactionKey, { rows: JSON.stringify(txns), players: JSON.stringify(tradePlayers), lastSuccessAt, excludedTradeCount: feed.excludedTradeCount });
       transactionStatus = { status: 'ready', lastSuccessAt, excludedTradeCount: feed.excludedTradeCount };
     } catch (error) {
       scope.assertCurrent();
       if (error?.code === 'YAHOO_DATA_MISMATCH') throw error;
       _rawCache(scope);
       const saved = _yahooTransactionStash.get(transactionKey);
-      if (saved) txns = JSON.parse(saved.rows);
+      if (saved) { txns = JSON.parse(saved.rows); tradePlayers = JSON.parse(saved.players || '{}'); }
       transactionStatus = { status: saved ? 'stale' : 'unavailable', lastSuccessAt: saved?.lastSuccessAt || null,
         excludedTradeCount: saved?.excludedTradeCount || 0,
         message: saved ? 'Yahoo trades could not refresh. Showing the last confirmed feed.' : 'Yahoo trades are unavailable. This does not mean there were no trades.' };
@@ -1147,7 +1141,7 @@ const YahooProvider = {
       league: mapped.league,
       rosters: mapped.rosters,
       leagueUsers: mapped.leagueUsers,
-      players: mapped.players || {},
+      players: { ...tradePlayers, ...(mapped.players || {}) },
       transactions: transactionsByWeek,
       transactionStatus: { ...transactionStatus, provider: 'yahoo', leagueId: mapped.league.league_id, season: String(year), scope: 'executed_trades', checkedAt },
       tradedPicks: [],
@@ -1202,6 +1196,8 @@ window.Yahoo = {
 
   // Main connect (legacy — prefer .provider for new code)
   connectLeague,
+  isStateCurrent,
+  captureStateContext,
 
   // Unified PlatformProvider interface
   provider: YahooProvider,
