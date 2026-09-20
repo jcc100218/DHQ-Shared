@@ -61,7 +61,7 @@
   //     //     leagueUsers: [],    // owners
   //     //     players: {},        // platform-specific extras to merge into S.players
   //     //     transactions: { wK: [] },
-  //     //     transactionStatus: { // optional; present for ESPN trade feed
+  //     //     transactionStatus: { // optional; present for ESPN/Yahoo completed trade feeds
   //     //       provider, leagueId, season, scope: 'executed_trades',
   //     //       status: 'ready' | 'stale' | 'unavailable', checkedAt,
   //     //       lastSuccessAt, excludedTradeCount, message?

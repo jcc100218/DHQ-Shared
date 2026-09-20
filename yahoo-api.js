@@ -618,34 +618,70 @@ function mapYahooSettings(leagueData, teamsData, leagueKey, year) {
 /**
  * Map a Yahoo transaction → Sleeper-compatible trade object.
  */
-function mapYahooTrade(tx) {
-  if (!tx || tx.type !== 'trade') return null;
-  const pArr    = _yahooArr(tx.players || {});
-  const sideMap = {};
-
-  pArr.forEach(pEntry => {
-    const pData   = pEntry?.player;
-    if (!pData) return;
-    const pMeta   = _yahooMeta(pData);
-    const pInfo   = _resourceMetadata(pMeta);
-    const pSelObj = _yahooData(pData);
-    const yahooId = String(pInfo?.player_id || pInfo?.player_key?.split('.p.').pop() || '');
-    const destKey = pSelObj?.transaction_data?.destination_team_key || '';
-    if (!yahooId || !destKey) return;
-
-    const destId = destKey.split('.t.').pop();
-    if (!sideMap[destId]) sideMap[destId] = { roster_id: destId, adds: [], drops: [] };
-    sideMap[destId].adds.push('yahoo_' + yahooId);
+function mapYahooTrade(tx, crosswalk = {}) {
+  if (!tx || tx.type !== 'trade' || tx.status !== 'successful') return null;
+  const sides = {}, adds = {}, drops = {}, owners = new Set();
+  _yahooArr(tx.players || {}).forEach(entry => {
+    const meta = _resourceMetadata(_yahooMeta(entry?.player));
+    const move = _resourceMetadata(_yahooData(entry?.player)?.transaction_data);
+    const yahooId = String(meta?.player_id || meta?.player_key?.split('.p.').pop() || '');
+    const from = move?.source_team_key?.split('.t.').pop(), to = move?.destination_team_key?.split('.t.').pop();
+    if (!yahooId || !from || !to) return;
+    const id = crosswalk[yahooId] || 'yahoo_' + yahooId;
+    owners.add(from); owners.add(to);
+    sides[from] ||= { players: [], picks: [] };
+    sides[to] ||= { players: [], picks: [] };
+    sides[to].players.push(id); adds[id] = to; drops[id] = from;
   });
-
-  return {
-    type:      'trade',
-    status:    tx.status === 'successful' ? 'complete' : 'pending',
-    timestamp: parseInt(tx.timestamp || 0) * 1000,
-    week:      parseInt((tx.transaction_key || '').split('.').pop() || 0),
-    sides:     Object.values(sideMap),
-    _source:   'yahoo',
-  };
+  const timestamp = Number(tx.timestamp) * 1000;
+  return { transaction_id: tx.transaction_key, type: 'trade', status: 'complete',
+    timestamp, created: timestamp, status_updated: timestamp,
+    // Yahoo transaction IDs are not NFL weeks. The documented timestamp does
+    // not establish a scoring period; retain unknown week 0, never today's week.
+    week: 0, roster_ids: [...owners], adds, drops, sides, _source: 'yahoo' };
+}
+function _transactionRows(raw, leagueKey, season, crosswalk, rosters) {
+  const collection = _leagueReply(raw, leagueKey, season).data.transactions;
+  const count = _collectionCount(collection?.count);
+  const incomplete = message => new Error('Yahoo did not return a usable completed trade feed: ' + message);
+  if (!collection || !Number.isInteger(count) || count > 10000 ||
+      Object.keys(collection).filter(key => /^\d+$/.test(key)).length !== count) throw incomplete('transaction collection is incomplete.');
+  const owners = new Set(rosters.map(roster => String(roster.roster_id))), keys = new Set(), rows = [];
+  let excludedTradeCount = 0;
+  for (let i = 0; i < count; i++) {
+    const resource = collection[i]?.transaction;
+    const tx = { ..._resourceMetadata(_yahooMeta(resource)), ..._yahooData(resource) };
+    if (!resource || typeof tx.type !== 'string' || !tx.type.trim() || typeof tx.status !== 'string' || !tx.status.trim()) throw incomplete('transaction type or completion status is missing.');
+    if (!['trade', 'pending_trade'].includes(tx.type)) throw incomplete('unexpected transaction type.');
+    if (tx.type !== 'trade' || tx.status !== 'successful') { excludedTradeCount++; continue; }
+    const key = tx.transaction_key;
+    if (typeof key !== 'string' || !key.startsWith(leagueKey + '.tr.')) throw _dataMismatch('trade identity belongs to another league or is missing.');
+    if (!/^\d+$/.test(key.slice(leagueKey.length + 4)) || keys.has(key) ||
+        (tx.transaction_id != null && String(tx.transaction_id) !== key.slice(leagueKey.length + 4)) ||
+        !['number', 'string'].includes(typeof tx.timestamp) || !/^\d+$/.test(String(tx.timestamp)) || !Number.isSafeInteger(Number(tx.timestamp)) || Number(tx.timestamp) <= 0) throw incomplete('trade ID or timestamp is invalid.');
+    keys.add(key);
+    const players = tx.players, n = _collectionCount(players?.count), seen = new Set(), teams = new Set();
+    if (!players || !Number.isInteger(n) || n < 1 || n > 1000 || Object.keys(players).filter(k => /^\d+$/.test(k)).length !== n) throw incomplete('trade players are incomplete.');
+    for (let j = 0; j < n; j++) {
+      const player = players[j]?.player, meta = _resourceMetadata(_yahooMeta(player));
+      const move = _resourceMetadata(_yahooData(player)?.transaction_data);
+      const id = String(meta?.player_id || meta?.player_key?.split('.p.').pop() || '');
+      if (!/^\d+$/.test(id) || seen.has(id) || !move || move.type !== 'trade') throw incomplete('trade player or movement is missing.');
+      if (meta.player_key != null && meta.player_key !== leagueKey.split('.l.')[0] + '.p.' + id) throw _dataMismatch('trade player identity belongs to another game.');
+      const from = move.source_team_key, to = move.destination_team_key;
+      for (const team of [from, to]) {
+        if (typeof team !== 'string' || !team.startsWith(leagueKey + '.t.')) throw _dataMismatch('trade team identity belongs to another league or is missing.');
+        const owner = team.slice(leagueKey.length + 3);
+        if (!owners.has(owner)) throw incomplete('trade refers to an unconfirmed team.');
+        teams.add(owner);
+      }
+      if (from === to) throw incomplete('trade source and destination are identical.');
+      seen.add(id);
+    }
+    if (teams.size < 2) throw incomplete('trade sides are incomplete.');
+    rows.push(mapYahooTrade(tx, crosswalk));
+  }
+  return { rows, excludedTradeCount };
 }
 
 // ── Player crosswalk ──────────────────────────────────────────────
@@ -918,12 +954,14 @@ function _hasYahooSession() {
 }
 
 let _yahooRawStash = new Map();
+let _yahooTransactionStash = new Map();
 let _yahooCacheBoundary = '';
 function _rawCache(scope) {
   scope.assertCurrent();
   const boundary = JSON.stringify([scope.ownerKey, scope.sessionVersion, scope.sessionId, scope.token, scope.epoch]);
   if (boundary !== _yahooCacheBoundary) {
     _yahooRawStash = new Map();
+    _yahooTransactionStash = new Map();
     _yahooCacheBoundary = boundary;
   }
   return _yahooRawStash;
@@ -940,6 +978,22 @@ function _getYahooStashedRaw(leagueKey, scope) {
 const YahooProvider = {
   id: 'yahoo',
   displayName: 'Yahoo',
+  // A mounted consumer captures this once, rather than adopting a different
+  // account/provider session when the user presses retry later.
+  captureContext(league) {
+    const selected = _selectedLeague(league, {}), scope = _connectionContext();
+    let active = true;
+    return { isCurrent() {
+      if (!active) return false;
+      try {
+        scope.assertCurrent();
+        const now = _selectedLeague(league, {});
+        if (now.key === selected.key && now.season === selected.season) return true;
+      } catch { /* Changed account/league requires reopening the view. */ }
+      active = false;
+      return false;
+    } };
+  },
   capabilities: {
     hasTransactions: true,
     hasDrafts: false,
@@ -1016,7 +1070,6 @@ const YahooProvider = {
     const scope = _connectionContext(context);
     const leagueKey = await _resolvedLeagueKey(selection.key, scope, selection.season);
     const sleeperPlayers = context.sleeperPlayers || {};
-    const currentWeek = context.currentWeek != null ? context.currentWeek : 0;
 
     // Reuse stashed raw if connect() was just called
     let leagueData, teamsData, rostersData;
@@ -1064,32 +1117,31 @@ const YahooProvider = {
 
     const mapped = mapToSleeperState(leagueData, teamsData, rostersData, leagueKey, year, crosswalk);
 
-    // Transactions — trade-only from Yahoo
-    let txns = [];
+    // This endpoint is a completed trade feed, not add/drop/waiver history.
+    let txns = [], transactionStatus;
+    const transactionKey = leagueKey + ':' + year, checkedAt = Date.now();
     try {
       const txRaw = await fetchTransactions(leagueKey, scope, year);
-      const txFc  = txRaw?.fantasy_content || {};
-      const txLg  = txFc.league || [];
-      const txD   = _yahooData(Array.isArray(txLg) ? txLg : [txLg]);
-      const txArr = _yahooArr(txD?.transactions || {});
-      txns = txArr
-        .map(tEntry => {
-          const tx = tEntry?.transaction;
-          if (!tx) return null;
-          const tMeta = _yahooMeta(Array.isArray(tx) ? tx : [tx]);
-          const tData = _yahooData(Array.isArray(tx) ? tx : [tx]);
-          return mapYahooTrade({ ...tMeta, ...tData });
-        })
-        .filter(Boolean);
-    } catch (e) {
-      scope.assertCurrent(); // Optional provider outage cannot swallow account/selection changes.
-      if (e?.code === 'YAHOO_DATA_MISMATCH') throw e;
-      console.warn('[Yahoo] transactions fetch failed:', e?.message || e);
+      scope.assertCurrent();
+      const feed = _transactionRows(txRaw, leagueKey, year, crosswalk, mapped.rosters);
+      txns = feed.rows;
+      const lastSuccessAt = Date.now();
+      _rawCache(scope); // Revalidate the account/session boundary before caching.
+      _yahooTransactionStash.set(transactionKey, { rows: JSON.stringify(txns), lastSuccessAt, excludedTradeCount: feed.excludedTradeCount });
+      transactionStatus = { status: 'ready', lastSuccessAt, excludedTradeCount: feed.excludedTradeCount };
+    } catch (error) {
+      scope.assertCurrent();
+      if (error?.code === 'YAHOO_DATA_MISMATCH') throw error;
+      _rawCache(scope);
+      const saved = _yahooTransactionStash.get(transactionKey);
+      if (saved) txns = JSON.parse(saved.rows);
+      transactionStatus = { status: saved ? 'stale' : 'unavailable', lastSuccessAt: saved?.lastSuccessAt || null,
+        excludedTradeCount: saved?.excludedTradeCount || 0,
+        message: saved ? 'Yahoo trades could not refresh. Showing the last confirmed feed.' : 'Yahoo trades are unavailable. This does not mean there were no trades.' };
+      console.warn('[Yahoo] transactions fetch failed:', error?.message || error);
     }
-
     scope.assertCurrent();
-    const wkKey = 'w' + currentWeek;
-    const transactionsByWeek = txns.length ? { [wkKey]: txns } : {};
+    const transactionsByWeek = txns.length ? { w0: txns } : {};
 
     return {
       league: mapped.league,
@@ -1097,6 +1149,7 @@ const YahooProvider = {
       leagueUsers: mapped.leagueUsers,
       players: mapped.players || {},
       transactions: transactionsByWeek,
+      transactionStatus: { ...transactionStatus, provider: 'yahoo', leagueId: mapped.league.league_id, season: String(year), scope: 'executed_trades', checkedAt },
       tradedPicks: [],
       drafts: [],
       matchups: [],
