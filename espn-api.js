@@ -262,20 +262,35 @@ function mapESPNRoster(team, crosswalk) {
 }
 
 /**
- * Map ESPN transactions → array of Sleeper-compatible transaction objects.
+ * Map an ESPN executed trade to shared transaction and received-side contracts.
+ * Pending, rejected and unknown provider statuses are never completed history.
  */
-function mapESPNTrade(espnTx) {
-  if (!espnTx || espnTx.type !== 'TRADE') return null;
+function mapESPNTrade(espnTx, crosswalk = {}) {
+  if (!espnTx || espnTx.type !== 'TRADE' || espnTx.status !== 'EXECUTED') return null;
+  const playerId = player => crosswalk[player.id] || ('espn_' + player.id);
+  const teamMoves = (espnTx.teams || []).map(side => ({
+    roster_id: String(side.fromTeamId),
+    adds: (side.playersAdded || []).map(playerId),
+    drops: (side.playersDropped || []).map(playerId),
+  }));
+  const timestamp = espnTx.executionDate || espnTx.proposedDate || 0;
+  const adds = {}, drops = {};
+  const sides = {};
+  teamMoves.forEach(side => {
+    sides[side.roster_id] = { players: [...side.adds], picks: [] };
+    side.adds.forEach(id => { adds[id] = side.roster_id; });
+    side.drops.forEach(id => { drops[id] = side.roster_id; });
+  });
   return {
     type: 'trade',
-    status: espnTx.status === 'EXECUTED' ? 'complete' : 'pending',
-    timestamp: espnTx.executionDate || espnTx.proposedDate || 0,
+    status: 'complete',
+    timestamp,
+    created: espnTx.proposedDate || timestamp,
+    status_updated: timestamp,
+    roster_ids: teamMoves.map(side => side.roster_id),
+    adds, drops,
     week: espnTx.scoringPeriodId || 0,
-    sides: (espnTx.teams || []).map(side => ({
-      roster_id: String(side.fromTeamId),
-      adds: (side.playersAdded || []).map(p => p.id),
-      drops: (side.playersDropped || []).map(p => p.id),
-    })),
+    sides,
     _source: 'espn',
   };
 }
@@ -549,6 +564,39 @@ async function connectLeague(leagueId, year, espnS2, swid, myTeamId) {
 // left empty.
 
 const _espnRawStash = {};
+// Transaction failures must not erase the last confirmed feed. The cache is
+// memory-only and bound to account/connection, independently of a mounted view.
+const _espnTransactionStash = new Map();
+function _transactionRows(raw, leagueId, year, crosswalk, rosters) {
+  if (!raw || !Array.isArray(raw.topics) ||
+      (raw.id != null && String(raw.id) !== String(leagueId)) ||
+      (raw.seasonId != null && String(raw.seasonId) !== String(year)) ||
+      raw.topics.some(topic => !topic || typeof topic !== 'object' || typeof topic.type !== 'string')) {
+    throw new Error('ESPN did not return a usable trade feed for this league and season.');
+  }
+  const owners = new Set(rosters.map(roster => String(roster.roster_id)));
+  const trades = raw.topics.filter(topic => topic.type === 'TRADE');
+  if (trades.some(topic => typeof topic.status !== 'string' || !topic.status.trim())) {
+    throw new Error('ESPN returned a trade without a usable completion status.');
+  }
+  trades.filter(topic => topic.status === 'EXECUTED').forEach(topic => {
+    const teams = topic.teams;
+    if (!Array.isArray(teams) || teams.length < 2 || new Set(teams.map(team => String(team?.fromTeamId))).size !== teams.length ||
+        teams.some(team => !owners.has(String(team?.fromTeamId)) || (team.playersAdded != null && !Array.isArray(team.playersAdded)) || (team.playersDropped != null && !Array.isArray(team.playersDropped)) ||
+          [...(team.playersAdded || []), ...(team.playersDropped || [])].some(player => !/^\d+$/.test(String(player?.id ?? '')))) ||
+        !teams.some(team => team.playersAdded?.length || team.playersDropped?.length)) {
+      throw new Error('ESPN returned an incomplete trade.');
+    }
+  });
+  return { rows: trades.map(topic => mapESPNTrade(topic, crosswalk)).filter(Boolean),
+    excludedTradeCount: trades.filter(topic => topic.status !== 'EXECUTED').length };
+}
+function _cachedTransactions(key, scope, espnS2, swid) {
+  const saved = _espnTransactionStash.get(key);
+  if (!saved || saved.scope.token !== scope.token || saved.espnS2 !== (espnS2 || null) || saved.swid !== (swid || null)) return null;
+  try { saved.scope.assertCurrent(); scope.assertCurrent(); } catch (_) { return null; }
+  return saved;
+}
 function _stashEspnRaw(leagueId, year, raw, scope, espnS2, swid) {
   _espnRawStash[leagueId + '_' + year] = { raw, scope, espnS2: espnS2 || null, swid: swid || null, ts: Date.now() };
 }
@@ -664,7 +712,6 @@ const EspnProvider = {
 
     const context = ctx || {};
     const sleeperPlayers = context.sleeperPlayers || {};
-    const currentWeek = context.currentWeek != null ? context.currentWeek : 0;
 
     const raw = _validateLeague(_getEspnStashedRaw(leagueId, year, scope, espnS2, swid) || await fetchLeague(leagueId, year, espnS2, swid, scope), leagueId, year);
     scope.assertCurrent();
@@ -679,22 +726,36 @@ const EspnProvider = {
     // Fetch transactions — ESPN provides trades via mTransactions2 view.
     // connectLeague() historically left this empty; the provider fills it.
     let txns = [];
+    const transactionKey = String(leagueId) + '_' + String(year);
+    const checkedAt = Date.now();
+    let transactionStatus;
     try {
       scope.assertCurrent();
       const txnRaw = await fetchTransactions(leagueId, year, espnS2, swid, scope);
       scope.assertCurrent();
-      const topics = txnRaw?.topics || [];
-      txns = topics
-        .map(t => mapESPNTrade(t))
-        .filter(Boolean);
+      const feed = _transactionRows(txnRaw, leagueId, year, crosswalk, mapped.rosters);
+      txns = feed.rows;
+      const lastSuccessAt = Date.now();
+      _espnTransactionStash.set(transactionKey, {
+        rows: JSON.stringify(txns), lastSuccessAt, excludedTradeCount: feed.excludedTradeCount,
+        scope: _requestContext(league.id), espnS2, swid,
+      });
+      transactionStatus = { status: 'ready', lastSuccessAt, excludedTradeCount: feed.excludedTradeCount };
     } catch (e) {
       scope.assertCurrent();
+      const saved = _cachedTransactions(transactionKey, scope, espnS2, swid);
+      if (saved) txns = JSON.parse(saved.rows);
+      transactionStatus = { status: saved ? 'stale' : 'unavailable', lastSuccessAt: saved?.lastSuccessAt || null, excludedTradeCount: saved?.excludedTradeCount || 0,
+        message: saved ? 'ESPN trades could not refresh. Showing the last confirmed feed.' : 'ESPN trades are unavailable. This does not mean there were no trades.' };
       console.warn('[ESPN] transactions fetch failed:', e?.message || e);
     }
     scope.assertCurrent();
 
-    const wkKey = 'w' + currentWeek;
-    const transactionsByWeek = txns.length ? { [wkKey]: txns } : {};
+    const transactionsByWeek = {};
+    txns.forEach(txn => {
+      const key = 'w' + (Number.isInteger(Number(txn.week)) && Number(txn.week) > 0 ? Number(txn.week) : 0);
+      (transactionsByWeek[key] ||= []).push(txn);
+    });
 
     return {
       league: mapped.league,
@@ -702,6 +763,8 @@ const EspnProvider = {
       leagueUsers: mapped.leagueUsers,
       players: mapped.players || {},
       transactions: transactionsByWeek,
+      transactionStatus: { ...transactionStatus, provider: 'espn', leagueId: mapped.league.league_id,
+        season: String(year), scope: 'executed_trades', checkedAt },
       tradedPicks: [],
       drafts: [],
       matchups: [],
