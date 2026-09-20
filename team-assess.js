@@ -128,10 +128,11 @@ window.App = window.App || {};
    * @param {Object} playerStats   - { pid: { seasonTotal, prevTotal, ... } }
    * @returns {Object}             - { pos: Set<pid> }
    */
-  function buildNflStarterSet(players, playerStats, nflStarterPool) {
+  function buildNflStarterSet(players, playerStats, nflStarterPool, valueContext) {
     const pool = nflStarterPool || buildNflStarterPool(12);
     const nflStarterSet = {};
-    const scoreMap = window.App?.LI?.playerScores || window.LI?.playerScores || null;
+    const scoreMap = valueContext ? valueContext.playerScores : (window.App?.LI?.playerScores || window.LI?.playerScores || null);
+    const valueFor = valueContext ? valueContext.valueFor : getDynastyValue;
     const sourceIds = scoreMap ? Object.keys(scoreMap) : Object.keys(players || {});
     // Single pass over the source list, bucketing by position — was 9 full scans
     // (one per DEPTH_POSITION), each re-walking the whole ~2k-12k list and re-
@@ -144,7 +145,7 @@ window.App = window.App || {};
       const bucket = byPos[normPos(p.position)];
       if (!bucket) continue;       // not a depth position we track
       // Prefer dynasty value; fall back to season stats
-      const val = scoreMap?.[pid] || getDynastyValue(pid);
+      const val = scoreMap?.[pid] || valueFor(pid);
       const pts = val > 0 ? val : (playerStats?.[pid]?.seasonTotal || playerStats?.[pid]?.prevTotal || 0);
       if (pts > 0) bucket.push({ pid, pts });
     }
@@ -479,6 +480,7 @@ window.App = window.App || {};
    */
   function assessTeam(roster, players, playerStats, leagueInfo, leagueUsers, nflStarterSet, ownerPicks, allRosters, dynamicConfig) {
     const _cfg = dynamicConfig || {};
+    const valueFor = _cfg.valueFor || getDynastyValue;
     const IDEAL_ROSTER = _cfg.idealRoster || buildIdealRoster(leagueInfo?.roster_positions);
     const MIN_STARTER_QUALITY = _cfg.minStarterQuality || buildMinStarterQuality(leagueInfo?.roster_positions);
     const POS_WEIGHTS = _cfg.posWeights || buildPosWeights(leagueInfo?.roster_positions);
@@ -571,7 +573,7 @@ window.App = window.App || {};
 
       // Sort display order by dynasty value
       const sortedIds = [...playerIds]
-        .map(id => ({ id, score: getDynastyValue(id) }))
+        .map(id => ({ id, score: valueFor(id) }))
         .sort((a, b) => b.score - a.score)
         .map(p => p.id);
 
@@ -629,7 +631,7 @@ window.App = window.App || {};
     // Offseason fallback: if no stats available, estimate weekly PPG from DHQ values
     // A roster with 87K total DHQ should project ~150+ PPG, not 0
     if (weeklyPts <= 0) {
-      const totalDHQ = (roster.players || []).reduce((s, pid) => s + getDynastyValue(pid), 0);
+      const totalDHQ = (roster.players || []).reduce((s, pid) => s + valueFor(pid), 0);
       // Rough mapping: 80K DHQ ≈ 140 PPG, 100K DHQ ≈ 170 PPG (based on typical correlation)
       weeklyPts = totalDHQ > 0 ? Math.round(totalDHQ / 550) : 0;
     }
@@ -721,13 +723,37 @@ window.App = window.App || {};
    * @param {Object} leagueInfo   - league object
    * @param {Array}  leagueUsers  - array of Sleeper user objects
    * @param {Array}  tradedPicks  - traded picks array
+   * @param {Object} [context]    - explicit { leagueId, season, playerScores, isCurrent }
    * @returns {Array}             - array of assessment objects
    */
-  function assessAllTeams(rosters, players, playerStats, leagueInfo, leagueUsers, tradedPicks) {
+  function assessAllTeams(rosters, players, playerStats, leagueInfo, leagueUsers, tradedPicks, context) {
+    const check = () => {
+      if (context && (String(context.leagueId) !== pickLeagueId(leagueInfo) || String(context.season) !== String(leagueInfo?.season)
+          || (context.isCurrent && !context.isCurrent()))) throw new Error('The assessment league or account changed.');
+    };
+    check();
+    let valueContext = null;
+    if (context) {
+      if (!context.playerScores || Array.isArray(context.playerScores) || typeof context.playerScores !== 'object'
+          || !Object.keys(context.playerScores).length || Object.values(context.playerScores).some(v => !Number.isFinite(v) || v < 0)) {
+        throw new Error('League values are unavailable for this assessment.');
+      }
+      // Mirrors the existing dynastyValue contract, including inactive/retired
+      // players. Injury status (including IR) does not erase a player's value.
+      valueContext = { playerScores: context.playerScores, valueFor: pid => {
+        const p = players?.[pid];
+        if (!p || p.status === 'Inactive' || p.status === 'Retired') return 0;
+        return context.playerScores[pid] > 0 ? context.playerScores[pid] : 0;
+      } };
+      // An explicitly provided draft list belongs to this assessment. Never
+      // adopt an unrelated active bridge's draft list for background work.
+      leagueInfo = { ...leagueInfo, drafts: Array.isArray(leagueInfo.drafts) ? leagueInfo.drafts : [] };
+    }
+    const valueFor = valueContext ? valueContext.valueFor : getDynastyValue;
     const rosterPositions = leagueInfo?.roster_positions || [];
     const totalTeams = (rosters || []).length;
     const nflStarterPool = buildNflStarterPool(totalTeams);
-    const nflStarterSet = buildNflStarterSet(players, playerStats, nflStarterPool);
+    const nflStarterSet = buildNflStarterSet(players, playerStats, nflStarterPool, valueContext);
     const picksByOwner  = buildPicksByOwner(rosters, leagueInfo, tradedPicks);
 
     // Compute WEEKLY_TARGET from league data — median of all teams' optimal PPG
@@ -740,6 +766,7 @@ window.App = window.App || {};
       minStarterQuality: buildMinStarterQuality(rosterPositions),
       posWeights: buildPosWeights(rosterPositions),
       weeklyTarget: WEEKLY_TARGET_DYN,
+      ...(valueContext ? { valueFor } : {}),
     };
 
     // League median of projected starter points per position — feeds the
@@ -790,7 +817,7 @@ window.App = window.App || {};
     let maxDHQ = 0;
     assessments.forEach(a => {
       const r = rosterById[a.rosterId];
-      const totalDHQ = (r?.players || []).reduce((s, pid) => s + getDynastyValue(pid), 0);
+      const totalDHQ = (r?.players || []).reduce((s, pid) => s + valueFor(pid), 0);
       a.totalDHQ = totalDHQ;
       if (totalDHQ > maxDHQ) maxDHQ = totalDHQ;
     });
@@ -808,7 +835,14 @@ window.App = window.App || {};
       })
       .forEach((a, i) => { a.powerRank = i + 1; });
 
-    return assessments;
+    check();return assessments;
+  }
+
+  // An explicit capability name prevents a consumer on an older shared pin
+  // from silently passing a seventh argument that the old function ignores.
+  function assessAllTeamsWithContext(rosters, players, playerStats, leagueInfo, leagueUsers, tradedPicks, context) {
+    if (!context || typeof context.isCurrent !== 'function') throw new Error('A current assessment context is required.');
+    return assessAllTeams(rosters, players, playerStats, leagueInfo, leagueUsers, tradedPicks, context);
   }
 
   // ─────────────────────────────────────────────────────────────
@@ -1356,6 +1390,7 @@ window.App = window.App || {};
   window.App.calcOptimalPPG     = calcOptimalPPG;
   window.App.assessTeam         = assessTeam;
   window.App.assessAllTeams     = assessAllTeams;
+  window.App.assessAllTeamsWithContext = assessAllTeamsWithContext;
   window.App.buildPicksByOwner  = buildPicksByOwner;
 
   // Convenience wrappers (read from War Room Scout globals)

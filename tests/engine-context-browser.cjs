@@ -6,6 +6,8 @@ const assert=require('node:assert/strict'),fs=require('node:fs'),path=require('n
 const {chromium}=require('@playwright/test'),{fixture,token}=require('./helpers/engine-fixture.cjs');
 const root=path.resolve(__dirname,'..'),out=path.resolve(process.argv[2]||'tmp/engine-context-browser'),data=fixture();
 const files=['storage.js','dhq-core.js','pick-value-model.js','dhq-providers.js','points-ledger.js','one-brain.js','dhq-engine.js'];
+const includeAssessments=process.env.DHQ_TEST_ASSESSMENTS==='1';
+if(includeAssessments)files.push('intelligence-context.js','team-assess.js');
 const html=`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>body{font:16px system-ui;margin:20px;background:#17202b;color:white}button{min-height:44px;margin:5px;padding:10px;font:inherit}pre{white-space:pre-wrap;overflow-wrap:anywhere}</style></head><body>
 <h1>Engine context verification</h1><p>Controlled fixture data. No provider mutations or connected accounts.</p>
 <button id="active">Load active league 111</button><button id="background">Load background league 222</button><pre id="result">Ready</pre>
@@ -46,6 +48,14 @@ function response(url){
   const page=await context.newPage();page.setDefaultTimeout(10000);page.on('pageerror',e=>{errors.push(e.message);console.error('Page error',e.message);});page.on('console',m=>{if(m.type()==='warning'||m.type()==='error')console.log('Browser',m.text());});await page.goto(origin);console.log('Fixture loaded');
   const original=await page.evaluate(()=>JSON.stringify(S));await page.getByRole('button',{name:'Load background league 222'}).click();await page.getByText('Ready 222 · 8 values',{exact:true}).waitFor();
   console.log('Background completed');assert.equal(await page.evaluate(()=>JSON.stringify(S)),original);assert.equal(await page.evaluate(()=>App.LI_LOADED),false);assert.equal(await page.evaluate(()=>events.length),0);assert.equal(await page.evaluate(()=>window.DhqBrain||null),null);
+  if(includeAssessments){
+   const assessment=await page.evaluate(()=>{
+    const league={...S.leagues[0],league_id:'222',drafts:[]},raw=localStorage.getItem('fw_session_v1');window.backgroundResult=lastResult;
+    window.assessmentContext={leagueId:'222',season:'2026',playerScores:lastResult.data.playerScores,isCurrent:()=>localStorage.getItem('fw_session_v1')===raw};
+    const rows=App.assessAllTeamsWithContext(S.rosters,S.players,{},league,[],[],assessmentContext);
+    return{totals:rows.map(r=>r.totalDHQ),expected:S.rosters.map(r=>r.players.reduce((n,id)=>n+(lastResult.data.playerScores[id]||0),0)),globalReady:App.LI_LOADED,brain:window.DhqBrain||null};
+   });assert.deepEqual(assessment.totals,assessment.expected);assert.equal(assessment.globalReady,false);assert.equal(assessment.brain,null);
+  }
   await page.getByRole('button',{name:'Load active league 111'}).click();await page.getByText('Ready 111 · 8 values',{exact:true}).waitFor();const first=await page.evaluate(()=>({scores:lastResult.data.playerScores,brain:lastResult.brain,reads:cacheReads,writes:cacheWrites}));assert(first.brain);assert(first.scores['101']>0);
   // Wait on an actual IDB read, not a timing assumption, before reload.
   const key=first.writes.find(k=>k.startsWith('dhq_leagueintel')&&k.includes(':111:'));
@@ -57,10 +67,11 @@ function response(url){
   await page.evaluate(()=>{S.currentLeagueId='222';S.leagues[0].league_id='222';S.leagues[0].scoring_settings.pass_td=6;});hold=true;await page.getByRole('button',{name:'Load active league 111'}).click();await page.getByText('Loading',{exact:true}).waitFor();while(!held.length)await new Promise(r=>setTimeout(r,20));
   const other=await context.newPage();await other.goto(origin);await other.evaluate(token=>localStorage.setItem('fw_session_v1',JSON.stringify({token,user:{id:'fixture-B'}})),token('fixture-B'));
   await page.waitForFunction(()=>!App.LI_LOADED);hold=false;held.splice(0).forEach(r=>r());await page.getByText(/Retry available:.*superseded/).waitFor();assert.equal(await page.evaluate(()=>window.DhqBrain),null);assert.equal(await page.evaluate(()=>lastResult),null);
+  if(includeAssessments)assert.equal(await page.evaluate(()=>{try{App.assessAllTeamsWithContext(S.rosters,S.players,{},S.leagues[0],[],[],{leagueId:'222',season:'2026',playerScores:{100:8000},isCurrent:()=>JSON.parse(localStorage.getItem('fw_session_v1')).user.id==='fixture-A'});return false;}catch{return true;}}),true);
   await page.screenshot({path:path.join(out,'account-switch-recovery.png')});
   await page.getByRole('button',{name:'Load active league 111'}).click();await page.getByText('Ready 222 · 8 values',{exact:true}).waitFor();assert.equal(await page.evaluate(()=>lastResult.leagueId),'222');assert.equal(await page.evaluate(()=>App.LI_LOADED),true);
   assert.deepEqual(blocked,[]);assert.deepEqual(errors,[]);
-  const result={modules:files,viewport:'390x844',checks:['explicit background context preserves active bridge','foreground values and actual one-brain','actual IndexedDB reload and matching cache adoption','real cross-tab account change cancels held cold work','same-view new-account retry succeeds'],externalWrites:0,pageErrors:errors,requests:requests.length,scope:'canonical modules in fixture shell; public product caller integration remains separate'};
+  const result={modules:files,viewport:'390x844',checks:['explicit background context preserves active bridge','foreground values and actual one-brain','actual IndexedDB reload and matching cache adoption','real cross-tab account change cancels held cold work','same-view new-account retry succeeds',...(includeAssessments?['explicit assessment uses returned league values while active LI is empty','assessment caller guard rejects replaced account']:[])],externalWrites:0,pageErrors:errors,requests:requests.length,scope:'canonical modules in fixture shell; public product caller integration remains separate'};
   fs.writeFileSync(path.join(out,'result.json'),JSON.stringify(result,null,2)+'\n');console.log(JSON.stringify(result,null,2));
  }finally{if(browser)await browser.close();await new Promise(r=>server.close(r));}
 })().catch(e=>{console.error(e);process.exitCode=1;});
