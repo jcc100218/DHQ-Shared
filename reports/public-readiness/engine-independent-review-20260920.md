@@ -2,7 +2,7 @@
 
 Reviewer lane: native_packaging, which did not author the engine change. Review checkout: `dhq-shared-review-engine-context`, branch `codex/review-engine-context-20260920`, exact candidate 1e7ef860aa18a25f03a46adb8e8859b7cdae9955, base f72c8e4. Only this report and independent evidence are added. No production edits, deployment, credentials or pin changes.
 
-**Disposition: hold this batch for four reproducible corrections.** The author accepted all four findings and is preparing a separate follow-up. Passing existing tests does not clear these gaps.
+**Current disposition: corrected batch1e7ef86+6d3d604 independently cleared; see the dated follow-up below.** Initial review held1e7ef86 for these four reproducible findings. Their original evidence is retained; the author repaired all four and the reviewer reran the exact reproductions and24groups.
 
 ## Material findings
 
