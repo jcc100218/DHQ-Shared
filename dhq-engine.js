@@ -2617,6 +2617,12 @@ Object.defineProperty(window.App, 'LI_LOADED', {
 window.App.loadLICache = loadLICache;
 window.App.saveLICache = saveLICache;
 window.App.loadLeagueIntel = loadLeagueIntel;
+// Explicit capability for background consumers: an older asset must never
+// silently ignore {state} and publish the unrelated active league instead.
+window.App.loadLeagueIntelContext = function(options){
+  if(!options?.state)return Promise.reject(new Error('An explicit league snapshot is required.'));
+  return loadLeagueIntel({...options,publish:false});
+};
 window.App.dynastyValue = dynastyValue;
 window.App.getPlayerRank = getPlayerRank;
 window.App.isNoValue = isNoValue;
