@@ -4,7 +4,7 @@ const {fixture,A}=require('./yahoo-browser-binding.cjs');
 const deferred=()=>{let resolve;const promise=new Promise(r=>resolve=r);return{resolve,promise};};
 const tick=()=>new Promise(r=>setTimeout(r,0));
 const league={id:'yahoo_423.l.12345',_yahooLeagueKey:'423.l.12345',_platformCreds:{leagueKey:'423.l.12345'}};
-function raw(name='Private A',key='423.l.12345'){return{fantasy_content:{league:[{league_key:key,name,season:'2026',num_teams:2},{teams:{count:0},settings:[{roster_positions:[],stat_categories:{stats:[]}}],transactions:{count:0}}]}};}
+const {raw}=require('./helpers/yahoo-fixtures.cjs');
 function connected(options={}){const x=fixture(options);x.session.set('yahoo_session_id','provider-a');return x;}
 async function run(){let pass=0,fail=0;const test=async(name,fn)=>{try{await fn();pass++;console.log('PASS',name);}catch(e){fail++;console.error('FAIL',name,e.message);}};
 await test('delayed A API data never resolves into current B',async()=>{const wait=deferred(),x=connected({fetch:()=>wait.promise});const result=x.api.apiRequest('/users');x.install();wait.resolve(Response.json(raw()));await assert.rejects(result,/account changed|connection changed/);assert.equal(x.requests.length,1);});

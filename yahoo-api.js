@@ -260,6 +260,127 @@ async function apiRequest(endpoint, scope = _connectionContext()) {
   return data;
 }
 
+function _dataMismatch(message) {
+  const error = new Error('Yahoo data could not be confirmed for this league: ' + message);
+  error.code = 'YAHOO_DATA_MISMATCH';
+  return error;
+}
+function _checkedLeagueKey(value) {
+  if (typeof value !== 'string' || !/^(?:\d+|nfl)\.l\.\d+$/.test(value)) throw _dataMismatch('invalid league key. Reconnect the selected league.');
+  return value;
+}
+function _checkedSeason(value) {
+  if (!/^\d{4}$/.test(String(value || '')) || Number(value) < 1900) throw _dataMismatch('season is missing or invalid.');
+  return String(value);
+}
+async function _resolvedLeagueKey(value, scope, season) {
+  _checkedLeagueKey(value);
+  if (!value.startsWith('nfl.l.')) return value;
+  if (!scope.nflGame) {
+    const raw = await apiRequest('/game/nfl', scope);
+    const meta = _yahooMeta(raw?.fantasy_content?.game);
+    if (!meta || meta.code !== 'nfl' || !/^\d+$/.test(String(meta.game_key || ''))) throw _dataMismatch('Yahoo could not confirm the NFL game for this alias.');
+    scope.nflGame = { key: String(meta.game_key), season: _checkedSeason(meta.season) };
+  }
+  scope.assertCurrent();
+  if (season != null && scope.nflGame.season !== _checkedSeason(season)) throw _dataMismatch('NFL alias belongs to a different season. Use the selected season’s league key.');
+  return scope.nflGame.key + value.slice(3);
+}
+function _selectedLeague(league, context) {
+  const keys = [league?._platformCreds?.leagueKey, league?._yahooLeagueKey, league?._yahoo_key];
+  for (const field of ['id', 'league_id']) {
+    if (league?.[field] != null) {
+      if (typeof league[field] !== 'string' || !league[field].startsWith('yahoo_')) throw _dataMismatch('selected league identity is invalid.');
+      keys.push(league[field].slice(6));
+    }
+  }
+  const present = keys.filter(value => value != null && value !== '').map(_checkedLeagueKey);
+  if (!present.length || present.some(value => value !== present[0])) throw _dataMismatch('selected league identifiers disagree. Reconnect it.');
+  const seasons = [league?.season, context.currentSeason].filter(value => value != null && value !== '').map(_checkedSeason);
+  if (seasons.some(value => value !== seasons[0])) throw _dataMismatch('selected seasons disagree.');
+  return { key: present[0], season: seasons[0] };
+}
+function _leagueReply(raw, key, season) {
+  _checkedLeagueKey(key);
+  const row = raw?.fantasy_content?.league;
+  const meta = _yahooMeta(row), data = _yahooData(row);
+  if (!Array.isArray(row) || !meta || typeof meta !== 'object' || Array.isArray(meta) || meta.league_key !== key ||
+      !data || typeof data !== 'object' || Array.isArray(data)) throw _dataMismatch('provider league identity or content is missing or different.');
+  const actualSeason = _checkedSeason(meta.season);
+  if (season != null && actualSeason !== _checkedSeason(season)) throw _dataMismatch('provider season differs from the selected season.');
+  return { meta, data, season: actualSeason };
+}
+function _collectionCount(value) {
+  const text = typeof value === 'number' || typeof value === 'string' ? String(value) : '';
+  return /^\d+$/.test(text) ? Number(text) : NaN;
+}
+function _resourceMetadata(meta) {
+  return Array.isArray(meta) ? Object.assign({}, ...meta.filter(value => value && typeof value === 'object')) : meta;
+}
+function _settingsObject(value) {
+  return Array.isArray(value) && value.length === 1 ? value[0] : value;
+}
+function _validateSettings(value) {
+  const settings = _settingsObject(value);
+  const positions = settings?.roster_positions?.roster_position;
+  const modifiers = settings?.stat_modifiers?.stats?.stat;
+  if (!settings || Array.isArray(settings) || typeof settings !== 'object' || positions == null || modifiers == null) throw _dataMismatch('scoring or roster settings are incomplete.');
+  const rows = Array.isArray(positions) ? positions : [positions];
+  let slots = 0;
+  for (const row of rows) {
+    const count = _collectionCount(row?.count);
+    if (typeof row?.position !== 'string' || !row.position.trim() || !Number.isInteger(count) || count > 1000) throw _dataMismatch('roster position settings are incomplete.');
+    slots += count;
+  }
+  if (!slots) throw _dataMismatch('roster position settings are incomplete.');
+  const statRows = Array.isArray(modifiers) ? modifiers : [modifiers];
+  if (!statRows.length) throw _dataMismatch('scoring modifier settings are incomplete.');
+  const seen = new Set();
+  for (const stat of statRows) {
+    const id = _collectionCount(stat?.stat_id), amount = stat?.value;
+    if (!Number.isInteger(id) || seen.has(id) || !['number', 'string'].includes(typeof amount) || String(amount).trim() === '' || !Number.isFinite(Number(amount))) throw _dataMismatch('scoring modifier settings are incomplete.');
+    seen.add(id);
+  }
+}
+function _checkedTeamCollection(data, key, count, withRoster) {
+  const teams = data.teams;
+  if (!teams || _collectionCount(teams.count) !== count || Object.keys(teams).filter(k => /^\d+$/.test(k)).length !== count) throw _dataMismatch('team collection is incomplete.');
+  const keys = new Set();
+  for (let i = 0; i < count; i++) {
+    const row = teams[String(i)]?.team, first = _yahooMeta(row);
+    const meta = _resourceMetadata(first);
+    if (!Array.isArray(row) || !meta || typeof meta.team_key !== 'string' || !meta.team_key.startsWith(key + '.t.') || !/^\d+$/.test(meta.team_key.slice(key.length + 3)) || keys.has(meta.team_key)) throw _dataMismatch('team identity is missing, duplicated or belongs to another league.');
+    if (meta.team_id != null && String(meta.team_id) !== meta.team_key.slice(key.length + 3)) throw _dataMismatch('team key and ID disagree.');
+    keys.add(meta.team_key);
+    if (withRoster) {
+      const roster = _yahooData(row)?.roster;
+      const players = (roster?.['0'] || roster)?.players;
+      const n = _collectionCount(players?.count);
+      if (!players || !Number.isInteger(n) || n < 0 || n > 1000 || Object.keys(players).filter(k => /^\d+$/.test(k)).length !== n || Array.from({ length: n }, (_, j) => players[String(j)]?.player).some(value => !value)) throw _dataMismatch('roster player collection is incomplete.');
+      const playerIds = new Set();
+      for (let j = 0; j < n; j++) {
+        const entry = players[String(j)], meta = _resourceMetadata(_yahooMeta(entry.player));
+        const mapped = mapYahooPlayer(entry);
+        if (!mapped || !/^\d+$/.test(mapped._yahoo_id || '') || !mapped.full_name.trim() || !mapped.position || playerIds.has(mapped._yahoo_id)) throw _dataMismatch('roster player identity or mapping is incomplete.');
+        if (meta?.player_key != null && meta.player_key !== key.split('.l.')[0] + '.p.' + mapped._yahoo_id) throw _dataMismatch('roster player key and identity disagree.');
+        playerIds.add(mapped._yahoo_id);
+      }
+    }
+  }
+  return keys;
+}
+function _validatedBundle(leagueData, teamsData, rostersData, key, season) {
+  const base = _leagueReply(leagueData, key, season);
+  const teams = _leagueReply(teamsData, key, base.season), rosters = _leagueReply(rostersData, key, base.season);
+  const count = _collectionCount(base.meta.num_teams), settings = base.data.settings || base.meta.settings;
+  if (typeof base.meta.name !== 'string' || !base.meta.name.trim() || !Number.isInteger(count) || count < 1 || count > 1000 || !settings || typeof settings !== 'object' || !Object.keys(settings).length) throw _dataMismatch('league settings or team count are incomplete.');
+  _validateSettings(settings);
+  const teamKeys = _checkedTeamCollection(teams.data, key, count, false);
+  const rosterKeys = _checkedTeamCollection(rosters.data, key, count, true);
+  if ([...teamKeys].some(value => !rosterKeys.has(value))) throw _dataMismatch('teams and rosters describe different memberships.');
+  return Number(base.season);
+}
+
 // ── Fetch helpers ─────────────────────────────────────────────────
 
 /** All NFL leagues for the authenticated Yahoo user. */
@@ -268,23 +389,32 @@ async function fetchUserLeagues(scope = _connectionContext()) {
 }
 
 /** League settings + all teams (parallel). */
-async function fetchLeague(leagueKey, scope = _connectionContext()) {
+async function fetchLeague(leagueKey, scope = _connectionContext(), season) {
+  leagueKey = await _resolvedLeagueKey(leagueKey, scope, season);
   const [leagueData, teamsData] = await Promise.all([
     apiRequest(`/league/${leagueKey}/settings`, scope),
     apiRequest(`/league/${leagueKey}/teams`, scope),
   ]);
   scope.assertCurrent();
+  const verified = _leagueReply(leagueData, leagueKey, season);
+  _leagueReply(teamsData, leagueKey, verified.season);
   return { leagueData, teamsData };
 }
 
 /** All team rosters in one batch request via ;out=roster sub-resource. */
-async function fetchRosters(leagueKey, scope = _connectionContext()) {
-  return apiRequest(`/league/${leagueKey}/teams;out=roster`, scope);
+async function fetchRosters(leagueKey, scope = _connectionContext(), season) {
+  leagueKey = await _resolvedLeagueKey(leagueKey, scope, season);
+  const raw = await apiRequest(`/league/${leagueKey}/teams;out=roster`, scope);
+  _leagueReply(raw, leagueKey, season);
+  return raw;
 }
 
 /** Trade transactions for a league. */
-async function fetchTransactions(leagueKey, scope = _connectionContext()) {
-  return apiRequest(`/league/${leagueKey}/transactions;type=trade`, scope);
+async function fetchTransactions(leagueKey, scope = _connectionContext(), season) {
+  leagueKey = await _resolvedLeagueKey(leagueKey, scope, season);
+  const raw = await apiRequest(`/league/${leagueKey}/transactions;type=trade`, scope);
+  _leagueReply(raw, leagueKey, season);
+  return raw;
 }
 
 // ── Yahoo JSON parsing helpers ────────────────────────────────────
@@ -326,11 +456,11 @@ function mapYahooPlayer(entry) {
   const pArr  = entry?.player || entry;
   const pMeta = _yahooMeta(pArr);
   // In roster context pMeta is another array: [[field_obj, ...], selected_pos_obj]
-  const pInfo = Array.isArray(pMeta) ? pMeta[0] : pMeta;
+  const pInfo = _resourceMetadata(pMeta);
   if (!pInfo) return null;
 
   const yahooId   = String(pInfo.player_id || pInfo.player_key?.split('.p.').pop() || '');
-  const fullName  = pInfo.full_name || '';
+  const fullName  = pInfo.full_name || pInfo.name?.full || '';
   const nameParts = fullName.split(' ');
   const team      = _normTeam(pInfo.editorial_team_abbr || '');
   // display_position can be "WR,RB" — take first
@@ -357,7 +487,7 @@ function mapYahooRoster(teamEntry, crosswalk) {
   const tArr  = teamEntry?.team || teamEntry;
   const tMeta = _yahooMeta(tArr);
   const tData = _yahooData(tArr);
-  const tInfo = Array.isArray(tMeta) ? tMeta[0] : tMeta;
+  const tInfo = _resourceMetadata(tMeta);
 
   const teamId  = String(tInfo?.team_id || tInfo?.team_key?.split('.t.').pop() || '');
   const teamKey = tInfo?.team_key || '';
@@ -386,9 +516,9 @@ function mapYahooRoster(teamEntry, crosswalk) {
     const pData   = pEntry?.player;
     if (!pData) return;
     const pMeta   = _yahooMeta(pData);
-    const pInfo   = Array.isArray(pMeta) ? pMeta[0] : pMeta;
+    const pInfo   = _resourceMetadata(pMeta);
     const pSelObj = _yahooData(pData); // { selected_position: [...] }
-    const yahooId = String(pInfo?.player_id || '');
+    const yahooId = String(pInfo?.player_id || pInfo?.player_key?.split('.p.').pop() || '');
     if (!yahooId) return;
 
     const pid = (crosswalk && crosswalk[yahooId]) ? crosswalk[yahooId] : 'yahoo_' + yahooId;
@@ -435,7 +565,7 @@ function mapYahooSettings(leagueData, teamsData, leagueKey, year) {
   const lgArr  = leagueData?.fantasy_content?.league || [];
   const lgMeta = _yahooMeta(lgArr);
   const lgData = _yahooData(lgArr);
-  const settings = lgData?.settings || lgMeta?.settings || {};
+  const settings = _settingsObject(lgData?.settings || lgMeta?.settings || {});
 
   // ── Scoring settings ──
   const scoring_settings = {};
@@ -458,7 +588,7 @@ function mapYahooSettings(leagueData, teamsData, leagueKey, year) {
     if (!rp) return;
     const posKey = (rp.position || '').toUpperCase();
     const mapped = YAHOO_POS_MAP[posKey] || posKey;
-    const count  = parseInt(rp.count || 1);
+    const count  = parseInt(rp.count == null ? 1 : rp.count);
     for (let i = 0; i < count; i++) roster_positions.push(mapped);
   });
 
@@ -497,9 +627,9 @@ function mapYahooTrade(tx) {
     const pData   = pEntry?.player;
     if (!pData) return;
     const pMeta   = _yahooMeta(pData);
-    const pInfo   = Array.isArray(pMeta) ? pMeta[0] : pMeta;
+    const pInfo   = _resourceMetadata(pMeta);
     const pSelObj = _yahooData(pData);
-    const yahooId = String(pInfo?.player_id || '');
+    const yahooId = String(pInfo?.player_id || pInfo?.player_key?.split('.p.').pop() || '');
     const destKey = pSelObj?.transaction_data?.destination_team_key || '';
     if (!yahooId || !destKey) return;
 
@@ -645,7 +775,7 @@ function mapToSleeperState(leagueData, teamsData, rostersData, leagueKey, year, 
 
     const tArr  = tEntry.team;
     const tMeta = _yahooMeta(tArr);
-    const tInfo = Array.isArray(tMeta) ? tMeta[0] : tMeta;
+    const tInfo = _resourceMetadata(tMeta);
     const teamId = String(tInfo?.team_id || tInfo?.team_key?.split('.t.').pop() || '');
 
     const roster = mapYahooRoster(tEntry, cw);
@@ -672,8 +802,8 @@ function mapToSleeperState(leagueData, teamsData, rostersData, leagueKey, year, 
       const pData = pEntry?.player;
       if (!pData) return;
       const pMeta = _yahooMeta(pData);
-      const pInfo = Array.isArray(pMeta) ? pMeta[0] : pMeta;
-      const yahooId = String(pInfo?.player_id || '');
+      const pInfo = _resourceMetadata(pMeta);
+      const yahooId = String(pInfo?.player_id || pInfo?.player_key?.split('.p.').pop() || '');
       if (!yahooId) return;
 
       const sleeperPid = cw[yahooId] || ('yahoo_' + yahooId);
@@ -707,6 +837,8 @@ async function connectLeague(leagueKey, teamKey, options = {}) {
     (window.S || window.App?.S) === S && S.currentLeagueId === activeId &&
     (typeof options.isCurrent !== 'function' || options.isCurrent()) });
 
+  leagueKey = await _resolvedLeagueKey(leagueKey, scope, options.season || options.currentSeason);
+
   // ── 1. Fetch league settings + rosters in parallel ──
   const [{ leagueData, teamsData }, rostersData] = await Promise.all([
     fetchLeague(leagueKey, scope),
@@ -714,6 +846,8 @@ async function connectLeague(leagueKey, teamKey, options = {}) {
   ]);
 
   scope.assertCurrent();
+
+  const year = _validatedBundle(leagueData, teamsData, rostersData, leagueKey, options.season || options.currentSeason);
 
   // ── 2. Extract Yahoo players for crosswalk ──
   const rostersFC = rostersData?.fantasy_content || {};
@@ -733,8 +867,6 @@ async function connectLeague(leagueKey, teamKey, options = {}) {
     });
   });
 
-  const lgMeta = _yahooMeta(leagueData?.fantasy_content?.league || []);
-  const year   = parseInt(lgMeta?.season || new Date().getFullYear());
 
   // ── 3. Build crosswalk against Sleeper player DB ──
   const crosswalk = buildCrosswalk(S.players || {}, yahooPlayersForCW, year);
@@ -879,12 +1011,10 @@ const YahooProvider = {
     if (!_hasYahooSession()) {
       throw new Error('Yahoo session expired — please re-authenticate via Scout');
     }
-    const creds = league._platformCreds || this.loadCredentials(league.id) || {};
-    const leagueKey = creds.leagueKey || league._yahooLeagueKey;
-    if (!leagueKey) throw new Error('Yahoo league key missing');
-
     const context = ctx || {};
+    const selection = _selectedLeague(league, context);
     const scope = _connectionContext(context);
+    const leagueKey = await _resolvedLeagueKey(selection.key, scope, selection.season);
     const sleeperPlayers = context.sleeperPlayers || {};
     const currentWeek = context.currentWeek != null ? context.currentWeek : 0;
 
@@ -895,20 +1025,20 @@ const YahooProvider = {
       ({ leagueData, teamsData, rostersData } = stashed);
     } else {
       const [lgRes, rostersRes] = await Promise.all([
-        fetchLeague(leagueKey, scope),
-        fetchRosters(leagueKey, scope),
+        fetchLeague(leagueKey, scope, selection.season),
+        fetchRosters(leagueKey, scope, selection.season),
       ]);
       leagueData = lgRes.leagueData;
       teamsData = lgRes.teamsData;
       rostersData = rostersRes;
+      _validatedBundle(leagueData, teamsData, rostersData, leagueKey, selection.season);
       _stashYahooRaw(leagueKey, { leagueData, teamsData, rostersData }, scope);
     }
 
     scope.assertCurrent();
 
-    // Extract year from league metadata
-    const lgMeta = _yahooMeta(leagueData?.fantasy_content?.league || []);
-    const year = parseInt(lgMeta?.season || context.currentSeason || new Date().getFullYear(), 10);
+    // Validate cached data too; never infer a missing season from today's date.
+    const year = _validatedBundle(leagueData, teamsData, rostersData, leagueKey, selection.season);
 
     // Extract Yahoo players for crosswalk
     const rostersFC = rostersData?.fantasy_content || {};
@@ -937,7 +1067,7 @@ const YahooProvider = {
     // Transactions — trade-only from Yahoo
     let txns = [];
     try {
-      const txRaw = await fetchTransactions(leagueKey, scope);
+      const txRaw = await fetchTransactions(leagueKey, scope, year);
       const txFc  = txRaw?.fantasy_content || {};
       const txLg  = txFc.league || [];
       const txD   = _yahooData(Array.isArray(txLg) ? txLg : [txLg]);
@@ -953,6 +1083,7 @@ const YahooProvider = {
         .filter(Boolean);
     } catch (e) {
       scope.assertCurrent(); // Optional provider outage cannot swallow account/selection changes.
+      if (e?.code === 'YAHOO_DATA_MISMATCH') throw e;
       console.warn('[Yahoo] transactions fetch failed:', e?.message || e);
     }
 

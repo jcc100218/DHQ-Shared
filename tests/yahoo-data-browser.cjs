@@ -4,7 +4,7 @@ const {chromium}=require(process.env.PLAYWRIGHT_MODULE_PATH||'@playwright/test')
 const source=fs.readFileSync(path.resolve(__dirname,'../yahoo-api.js'),'utf8');
 const {account}=require('./yahoo-browser-binding.cjs');
 const app='https://dhqfootball.com/index.html',api='https://sxshiqyxhhifvtfqawbq.supabase.co/functions/v1/yahoo-proxy';
-const raw=name=>({fantasy_content:{league:[{league_key:'423.l.12345',name,season:'2026',num_teams:2},{teams:{count:0},settings:[{roster_positions:[],stat_categories:{stats:[]}}],transactions:{count:0}}]}});
+const {raw}=require('./helpers/yahoo-fixtures.cjs');
 (async()=>{let browser;try{
  browser=await chromium.launch({headless:true,executablePath:process.env.PLAYWRIGHT_CHROME_PATH||'/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'});
  const context=await browser.newContext({viewport:{width:320,height:700}}),page=await context.newPage();let blocked=null,mode='delay',name='Private A',calls=0;const unexpected=[];
